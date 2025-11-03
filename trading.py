@@ -114,12 +114,14 @@ def ensure_usdc_allowance(required_amount: float) -> bool:
             logger.error(
                 f"⚠️ Error in USDC allowance update (attempt {attempt + 1}): {e}"
             )
-            time.sleep(base_delay * (2 ** attempt))
+            time.sleep(base_delay * (2**attempt))
 
     return False
 
 
-def get_min_ask_data(asset: str, allow_price_fallback: bool = False) -> Optional[Dict[str, Any]]:
+def get_min_ask_data(
+    asset: str, allow_price_fallback: bool = False
+) -> Optional[Dict[str, Any]]:
     try:
         order = get_order_book(asset)
         asks = getattr(order, "asks", None)
@@ -166,7 +168,9 @@ def get_min_ask_data(asset: str, allow_price_fallback: bool = False) -> Optional
         return None
 
 
-def get_max_bid_data(asset: str, allow_price_fallback: bool = False) -> Optional[Dict[str, Any]]:
+def get_max_bid_data(
+    asset: str, allow_price_fallback: bool = False
+) -> Optional[Dict[str, Any]]:
     try:
         order = get_order_book(asset)
         bids = getattr(order, "bids", None)
@@ -245,7 +249,9 @@ def check_usdc_balance(state: ThreadSafeState, usdc_needed: float) -> bool:
                 }
             ],
         )
-        usdc_balance = usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
+        usdc_balance = (
+            usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
+        )
 
         logger.info(
             f"💵 USDC Balance: ${usdc_balance:.2f}, Required: ${usdc_needed:.2f}"
@@ -273,7 +279,10 @@ def find_position_by_asset(positions: dict, asset_id: str) -> Optional[PositionI
 
 def is_recently_bought(state: ThreadSafeState, asset_id: str) -> bool:
     with state._recent_trades_lock:
-        if asset_id not in state._recent_trades or state._recent_trades[asset_id]["buy"] is None:
+        if (
+            asset_id not in state._recent_trades
+            or state._recent_trades[asset_id]["buy"] is None
+        ):
             return False
         now = time.time()
         time_since_buy = now - state._recent_trades[asset_id]["buy"]
@@ -282,7 +291,10 @@ def is_recently_bought(state: ThreadSafeState, asset_id: str) -> bool:
 
 def is_recently_sold(state: ThreadSafeState, asset_id: str) -> bool:
     with state._recent_trades_lock:
-        if asset_id not in state._recent_trades or state._recent_trades[asset_id]["sell"] is None:
+        if (
+            asset_id not in state._recent_trades
+            or state._recent_trades[asset_id]["sell"] is None
+        ):
             return False
         now = time.time()
         time_since_sell = now - state._recent_trades[asset_id]["sell"]
@@ -305,7 +317,9 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
         # Check USDC presence (simulation or on-chain)
         if state.is_simulation_mode():
             if not check_usdc_balance(state, 0.01):
-                logger.info(f"❌ [SIM] No USDC balance available to place buy order for {asset}")
+                logger.info(
+                    f"❌ [SIM] No USDC balance available to place buy order for {asset}"
+                )
                 return False
         else:
             usdc_contract = w3.eth.contract(
@@ -322,7 +336,9 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                     }
                 ],
             )
-            usdc_balance = usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
+            usdc_balance = (
+                usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
+            )
             logger.info(f"usdc_balance: {usdc_balance}")
             if not usdc_balance:
                 logger.info(
@@ -411,7 +427,9 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                             pass
                 else:
                     if not ensure_usdc_allowance(amount_in_dollars):
-                        raise TradingError(f"Failed to ensure USDC allowance for {asset}")
+                        raise TradingError(
+                            f"Failed to ensure USDC allowance for {asset}"
+                        )
 
                     order_args = MarketOrderArgs(
                         token_id=str(asset),
@@ -421,7 +439,9 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                     signed_order = create_market_order(order_args)
                     response = post_order(signed_order, OrderType.FOK)
                     if response.get("success"):
-                        filled = response.get("data", {}).get("filledAmount", amount_in_dollars)
+                        filled = response.get("data", {}).get(
+                            "filledAmount", amount_in_dollars
+                        )
                         logger.info(
                             f"🛒 [{reason}] Order placed: BUY {filled:.4f} shares of {asset} at ${min_ask_price:.4f}"
                         )
@@ -447,22 +467,18 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 logger.error(f"❌ Trading error in BUY order for {asset}: {str(e)}")
                 if attempt == max_retries - 1:
                     raise
-                time.sleep(base_delay * (2 ** attempt))
+                time.sleep(base_delay * (2**attempt))
             except Exception as e:
-                logger.error(
-                    f"❌ Unexpected error in BUY order for {asset}: {str(e)}"
-                )
+                logger.error(f"❌ Unexpected error in BUY order for {asset}: {str(e)}")
                 if attempt == max_retries - 1:
                     raise TradingError(
                         f"Failed to process BUY order after {max_retries} attempts: {e}"
                     )
-                time.sleep(base_delay * (2 ** attempt))
+                time.sleep(base_delay * (2**attempt))
 
         return False
     except Exception as e:
-        logger.error(
-            f"❌ Error placing BUY order for {asset}: {str(e)}", exc_info=True
-        )
+        logger.error(f"❌ Error placing BUY order for {asset}: {str(e)}", exc_info=True)
         raise
 
 
@@ -473,7 +489,9 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
 
         for attempt in range(max_retries):
             try:
-                logger.info(f"🔄 Order attempt {attempt + 1}/{max_retries} for SELL {asset}")
+                logger.info(
+                    f"🔄 Order attempt {attempt + 1}/{max_retries} for SELL {asset}"
+                )
 
                 current_price = get_current_price(state, asset)
                 if current_price is None:
@@ -497,7 +515,9 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 positions = state.get_positions()
                 position = find_position_by_asset(positions, asset)
                 if not position:
-                    logger.warning(f"🙄 No position found for {asset}, Skipping sell...")
+                    logger.warning(
+                        f"🙄 No position found for {asset}, Skipping sell..."
+                    )
                     return False
 
                 balance = float(position.shares)
@@ -536,7 +556,9 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                     # Simulate immediate sell
                     filled = sell_amount_to_post
                     state.adjust_sim_usdc_balance(float(filled) * float(max_bid_price))
-                    ok = state.reduce_sim_position(asset, float(filled), float(max_bid_price))
+                    ok = state.reduce_sim_position(
+                        asset, float(filled), float(max_bid_price)
+                    )
                     if not ok:
                         raise TradingError("Failed to reduce simulated position")
                     logger.info(
@@ -572,23 +594,27 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 logger.error(f"❌ Trading error in SELL order for {asset}: {str(e)}")
                 if attempt == max_retries - 1:
                     raise
-                time.sleep(base_delay * (2 ** attempt))
+                time.sleep(base_delay * (2**attempt))
             except Exception as e:
                 logger.error(f"❌ Unexpected error in SELL order for {asset}: {str(e)}")
                 if attempt == max_retries - 1:
                     raise TradingError(
                         f"Failed to process SELL order after {max_retries} attempts: {e}"
                     )
-                time.sleep(base_delay * (2 ** attempt))
+                time.sleep(base_delay * (2**attempt))
 
         return False
     except Exception as e:
         logger.error(f"❌ Error placing SELL order for {asset}: {str(e)}")
         raise
 
-    
-if __name__ == '__main__':
-    min_data = get_min_ask_data("28929654325017891260337264839306034319671562771699628371124118705224608724113")
+
+if __name__ == "__main__":
+    min_data = get_min_ask_data(
+        "40327511169357748240045704787050704754498232939540076729461130541849910621594"
+    )
     print(min_data)
-    max_data = get_min_ask_data("43337151523437879906986251357847358178613236712919036009433099963474901213619")
+    max_data = get_min_ask_data(
+        "101602495579885790518816117313036997954555641489317544302786734589275814907944"
+    )
     print(max_data)

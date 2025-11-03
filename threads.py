@@ -3,7 +3,10 @@ import threading
 import logging
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from typing import Callable, Dict
+
+from pydantic import FutureDate
 
 from config import (
     THREAD_POOL_SIZE,
@@ -13,56 +16,35 @@ from config import (
 )
 from state import ThreadSafeState
 
-
 logger = logging.getLogger("polymarket_bot")
 
 
 class ThreadManager:
     def __init__(self, state: ThreadSafeState):
         self.state = state
-        self.threads: Dict[str, threading.Thread] = {}
-        self.thread_queues: Dict[str, Queue] = {}
+        self.futures = {}
         self.executor = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
         self.running = True
 
-    def start_thread(self, name: str, target: Callable[[ThreadSafeState], None]) -> None:
-        if name in self.threads and self.threads[name].is_alive():
+    def start_thread(
+        self, name: str, target: Callable[[ThreadSafeState], None]
+    ) -> None:
+        if name in self.futures:
             return
-
-        queue = Queue(maxsize=MAX_QUEUE_SIZE)
-        self.thread_queues[name] = queue
-
-        def thread_wrapper():
-            error_count = 0
-            consecutive_errors = 0
-            while self.running and not self.state.is_shutdown():
-                try:
-                    target(self.state)
-                    error_count = 0
-                    consecutive_errors = 0
-                    time.sleep(0.1)
-                except Exception as e:
-                    error_count += 1
-                    consecutive_errors += 1
-                    logger.error(f"❌ Error in {name} thread: {str(e)}")
-
-                    if consecutive_errors >= MAX_ERRORS:
-                        logger.error(
-                            f"❌ Too many consecutive errors in {name} thread. Restarting..."
-                        )
-                        time.sleep(THREAD_RESTART_DELAY)
-                        consecutive_errors = 0
-                    else:
-                        time.sleep(1)
-
-        thread = threading.Thread(target=thread_wrapper, daemon=True, name=name)
-        thread.start()
-        self.threads[name] = thread
+        future = self.executor.submit(target, self.state)
+        self.futures[name] = future
         logger.info(f"✅ Started thread: {name}")
 
     def stop(self) -> None:
         self.running = False
-        for thread in self.threads.values():
-            if thread.is_alive():
-                thread.join(timeout=5)
+        try:
+            # Signal threads to stop via shared state
+            self.state.shutdown()
+        except Exception:
+            pass
+        for name, future in list(self.futures.items()):
+            try:
+                future.result(timeout=5)
+            except Exception:
+                logger.debug(f"⚠️ Thread '{name}' did not join cleanly")
         self.executor.shutdown(wait=True)

@@ -14,7 +14,6 @@ from config import (
     MM_REFRESH_INTERVAL,
 )
 
-
 logger = logging.getLogger("polymarket_bot")
 
 
@@ -72,14 +71,26 @@ def run_passive_market_making(state: ThreadSafeState) -> None:
                     pos = next((p for p in positions if p.asset_id == asset_id), None)
                     shares = pos.shares if pos else 0.0
                     if shares > MM_MAX_INVENTORY:
-                        logger.debug(f"Skip quoting {asset_id}: inventory {shares:.2f} > {MM_MAX_INVENTORY}")
+                        logger.debug(
+                            f"Skip quoting {asset_id}: inventory {shares:.2f} > {MM_MAX_INVENTORY}"
+                        )
                         continue
 
                     try:
-                        buy_order = OrderArgs(price=bid_price, size=MM_ORDER_SIZE, side=BUY, token_id=asset_id)
+                        buy_order = OrderArgs(
+                            price=bid_price,
+                            size=MM_ORDER_SIZE,
+                            side=BUY,
+                            token_id=asset_id,
+                        )
                         signed_buy = create_limit_order(buy_order)
                         post_order(signed_buy, OrderType.GTC)
-                        sell_order = OrderArgs(price=ask_price, size=MM_ORDER_SIZE, side=SELL, token_id=asset_id)
+                        sell_order = OrderArgs(
+                            price=ask_price,
+                            size=MM_ORDER_SIZE,
+                            side=SELL,
+                            token_id=asset_id,
+                        )
                         signed_sell = create_limit_order(sell_order)
                         post_order(signed_sell, OrderType.GTC)
                         logger.info(

@@ -72,7 +72,12 @@ PCT_PROFIT = float(os.getenv('pct_profit'))
 PCT_LOSS = float(os.getenv('pct_loss'))
 CASH_PROFIT = float(os.getenv('cash_profit'))
 CASH_LOSS = float(os.getenv('cash_loss'))
+# Spike thresholds
+# Backward-compatible: if dedicated up/down thresholds are not provided,
+# fall back to the single 'spike_threshold'.
 SPIKE_THRESHOLD = float(os.getenv('spike_threshold'))
+SPIKE_THRESHOLD_UP = float(os.getenv('spike_threshold_up', os.getenv('spike_threshold', '0.02')))
+SPIKE_THRESHOLD_DOWN = float(os.getenv('spike_threshold_down', os.getenv('spike_threshold', '0.02')))
 SOLD_POSITION_TIME = float(os.getenv('sold_position_time'))
 HOLDING_TIME_LIMIT = float(os.getenv('holding_time_limit'))
 PRICE_HISTORY_SIZE = int(os.getenv('price_history_size'))
@@ -129,6 +134,17 @@ ORDERBOOK_CACHE_ENABLED = os.getenv('orderbook_cache_enabled', 'true').lower() i
 ORDERBOOK_RETRY_MAX = int(os.getenv('orderbook_retry_max', '3'))
 ORDERBOOK_RETRY_BASE_DELAY = float(os.getenv('orderbook_retry_base_delay', '0.2'))  # seconds
 ORDERBOOK_RETRY_JITTER_MS = int(os.getenv('orderbook_retry_jitter_ms', '50'))
+
+# Price update performance knobs (optional)
+# Number of assets to update per loop (round-robin). Set to <=0 to update all.
+PRICE_UPDATE_BATCH_SIZE = int(os.getenv('price_update_batch_size', '20'))
+# Minimum interval per loop (seconds). Controls sleep throttle.
+PRICE_UPDATE_MIN_INTERVAL = float(os.getenv('price_update_min_interval', '1.0'))
+# Whether to allow costly fallbacks (per-token price/orderbook calls) when batch books are missing.
+PRICE_UPDATE_FALLBACK_ENABLED = os.getenv('price_update_fallback_enabled', 'true').lower() in ('1', 'true', 'yes')
+# Cooperative yielding: insert micro-sleeps during inner loops
+PRICE_UPDATE_YIELD_EVERY_N = int(os.getenv('price_update_yield_every_n', '10'))
+PRICE_UPDATE_YIELD_SLEEP_MS = int(os.getenv('price_update_yield_sleep_ms', '0'))
 
 # Positions log printing (optional)
 POSITIONS_LOG_THROTTLE_SECS = float(os.getenv('positions_log_throttle_secs', '2.0'))

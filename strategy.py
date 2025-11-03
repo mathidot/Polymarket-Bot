@@ -3,7 +3,8 @@ import logging
 from typing import Optional
 
 from config import (
-    SPIKE_THRESHOLD,
+    SPIKE_THRESHOLD_UP,
+    SPIKE_THRESHOLD_DOWN,
     HOLDING_TIME_LIMIT,
     CASH_PROFIT,
     PCT_PROFIT,
@@ -16,19 +17,17 @@ from config import (
     POSITIONS_LOG_THROTTLE_SECS,
     ORDERBOOK_CACHE_ENABLED,
 )
+import log
 from state import ThreadSafeState, price_update_event
 from pricing import get_current_price
-from api import get_order_books_with_retry
+from api import get_order_book, get_order_books_with_retry
 from trading import (
-    is_recently_bought,
-    is_recently_sold,
     find_position_by_asset,
     get_min_ask_data,
     get_max_bid_data,
     place_buy_order,
     place_sell_order,
 )
-
 
 logger = logging.getLogger("polymarket_bot")
 
@@ -38,12 +37,16 @@ def detect_and_trade(state: ThreadSafeState) -> None:
     scan_count = 0
 
     while not state.is_shutdown():
+        logger.info("detect_and_trade tick")
         try:
             if price_update_event.wait(timeout=0.2):
                 price_update_event.clear()
 
-                if not any(state.get_price_history(asset_id) for asset_id in state._price_history.keys()):
-                    logger.debug("⏳ Waiting for price history to be populated...")
+                if not any(
+                    state.get_price_history(asset_id)
+                    for asset_id in state._price_history.keys()
+                ):
+                    logger.info("⏳ Waiting for price history to be populated...")
                     continue
 
                 positions_copy = state.get_positions()
@@ -72,33 +75,64 @@ def detect_and_trade(state: ThreadSafeState) -> None:
                             continue
 
                         delta = (new_price - old_price) / old_price
+                        logger.info(f"Asset {asset_id} price change: {delta:.2%}")
 
-                        if abs(delta) > SPIKE_THRESHOLD:
+                        # 买入逻辑：当价格涨幅超过指定阈值，快速买入（移除冷却期与对侧配对交易）
+                        if delta > SPIKE_THRESHOLD_UP:
                             if new_price < 0.20 or new_price > 0.80:
                                 continue
+                            logger.info(
+                                f"🟨 Spike Detected | Asset: {asset_id} | Delta: {delta:.2%} | Price: ${new_price:.4f}"
+                            )
+                            logger.info(
+                                f"🟢 Buy Signal | Asset: {asset_id} | Price: ${new_price:.4f}"
+                            )
+                            place_buy_order(state, asset_id, "Spike detected")
 
-                            opposite = state.get_asset_pair(asset_id)
-                            if not opposite:
-                                continue
+                        # 下跌保护：当价格下跌超过指定阈值，若有持仓则立即卖出
+                        if delta < -SPIKE_THRESHOLD_DOWN:
+                            try:
+                                positions_copy_local = state.get_positions()
+                                position = find_position_by_asset(positions_copy_local, asset_id)
+                                if position:
+                                    logger.info(
+                                        f"🛡️ Downward Spike Protection | Asset: {asset_id} | Delta: {delta:.2%} | Price: ${new_price:.4f}"
+                                    )
+                                    place_sell_order(state, asset_id, "Downward spike protection")
+                            except Exception:
+                                pass
 
-                            if delta > 0 and not is_recently_bought(state, asset_id):
-                                logger.info(
-                                    f"🟨 Spike Detected | Asset: {asset_id} | Delta: {delta:.2%} | Price: ${new_price:.4f}"
-                                )
-                                logger.info(
-                                    f"🟢 Buy Signal | Asset: {asset_id} | Price: ${new_price:.4f}"
-                                )
-                                if place_buy_order(state, asset_id, "Spike detected"):
-                                    place_sell_order(state, opposite, "Opposite trade")
-                            elif delta < 0 and not is_recently_sold(state, asset_id):
-                                logger.info(
-                                    f"🟨 Spike Detected | Asset: {asset_id} | Delta: {delta:.2%} | Price: ${new_price:.4f}"
-                                )
-                                logger.info(
-                                    f"🔴 Sell Signal | Asset: {asset_id} | Price: ${new_price:.4f}"
-                                )
-                                if place_sell_order(state, asset_id, "Spike detected"):
-                                    place_buy_order(state, opposite, "Opposite trade")
+                        # 即时卖出逻辑：当产生一定利润时（当前最佳卖价超过买入均价阈值），立即卖出
+                        try:
+                            positions_copy_local = state.get_positions()
+                            position = find_position_by_asset(positions_copy_local, asset_id)
+                            if position:
+                                bid_data = get_max_bid_data(asset_id, allow_price_fallback=True)
+                                current_sellable = None
+                                if bid_data and bid_data.get("max_bid_price") is not None:
+                                    current_sellable = float(bid_data.get("max_bid_price"))
+                                else:
+                                    # 回退到最新价格
+                                    current_sellable = float(new_price)
+
+                                avg_price = float(position.avg_price)
+                                cash_profit = (current_sellable - avg_price) * float(position.shares)
+                                pct_profit = ((current_sellable - avg_price) / avg_price) if avg_price > 0 else 0.0
+
+                                if cash_profit >= CASH_PROFIT or pct_profit >= PCT_PROFIT:
+                                    logger.info(
+                                        f"🎯 Instant Take Profit | Asset: {asset_id} | Profit: ${cash_profit:.2f} ({pct_profit:.2%}) | Sellable=${current_sellable:.4f} | Avg=${avg_price:.4f}"
+                                    )
+                                    place_sell_order(state, asset_id, "Instant take profit")
+                                # 即时止损：当损失超过阈值，立即卖出
+                                if cash_profit <= CASH_LOSS or pct_profit <= PCT_LOSS:
+                                    logger.info(
+                                        f"⛔ Instant Stop Loss | Asset: {asset_id} | Loss: ${cash_profit:.2f} ({pct_profit:.2%}) | Sellable=${current_sellable:.4f} | Avg=${avg_price:.4f}"
+                                    )
+                                    place_sell_order(state, asset_id, "Instant stop loss")
+                        except Exception:
+                            # 防御：卖出逻辑异常不影响整体扫描
+                            pass
 
                     except IndexError:
                         logger.debug(f"⏳ Building price history for {asset_id}")
@@ -106,7 +140,6 @@ def detect_and_trade(state: ThreadSafeState) -> None:
                     except Exception as e:
                         logger.error(f"❌ Error processing asset {asset_id}: {str(e)}")
                         continue
-
         except Exception as e:
             logger.error(f"❌ Error in detect_and_trade: {str(e)}")
             time.sleep(0.5)
@@ -150,7 +183,11 @@ def check_trade_exits(state: ThreadSafeState) -> None:
                     avg_price = position.avg_price
                     remaining_shares = position.shares
                     cash_profit = (best_bid_price - avg_price) * remaining_shares
-                    pct_profit = ((best_bid_price - avg_price) / avg_price) if avg_price > 0 else 0.0
+                    pct_profit = (
+                        ((best_bid_price - avg_price) / avg_price)
+                        if avg_price > 0
+                        else 0.0
+                    )
 
                     if current_time - last_traded > HOLDING_TIME_LIMIT:
                         logger.info(
@@ -177,7 +214,9 @@ def check_trade_exits(state: ThreadSafeState) -> None:
                         state.set_last_trade_time(time.time())
 
                 except Exception as e:
-                    logger.error(f"❌ Error checking trade exit for {asset_id}: {str(e)}")
+                    logger.error(
+                        f"❌ Error checking trade exit for {asset_id}: {str(e)}"
+                    )
                     continue
         except Exception as e:
             logger.error(f"❌ Error in check_trade_exits: {e}")
@@ -212,115 +251,59 @@ def detect_pair_sum_arbitrage(state: ThreadSafeState) -> None:
                 now = time.time()
                 if now - last_log_time >= 5:
                     logger.debug(
-                        f"🔍 Arbitrage Scan | Scan #{scan_count} | Pairs: {len(asset_ids)//2}"
+                        f"🔍 Arbitrage Scan | Scan #{scan_count} | Pairs: {len(asset_ids) // 2}"
                     )
                     last_log_time = now
 
-                # 批量抓取订单簿，减少每次检测的网络往返
-                tokens_to_fetch = set()
-                for a in asset_ids:
-                    b = state.get_asset_pair(a)
-                    if not _pair_processed_once(a, b):
-                        continue
-                    if not b:
-                        continue
-                    tokens_to_fetch.add(a)
-                    tokens_to_fetch.add(b)
-
-                books_map = {}
-                if tokens_to_fetch:
-                    # 优先使用缓存
-                    tokens_list = list(tokens_to_fetch)
-                    cache_map, cache_ts = state.get_order_books_cache()
-                    use_cache = False
-                    if ORDERBOOK_CACHE_ENABLED and state.is_order_books_cache_valid(ORDERBOOK_CACHE_TTL):
-                        if all(t in cache_map for t in tokens_list):
-                            books_map = {tid: cache_map.get(tid) for tid in tokens_list}
-                            use_cache = True
-                            age_ms = (time.time() - cache_ts) * 1000.0
-                            logger.debug(f"📚 Using cached order books | age={age_ms:.0f}ms | tokens={len(tokens_list)}")
-                    if not use_cache:
-                        try:
-                            books_list = get_order_books_with_retry(tokens_list)
-                            books_map = {tid: book for tid, book in zip(tokens_list, books_list)}
-                            if ORDERBOOK_CACHE_ENABLED:
-                                state.set_order_books_cache(books_map)
-                        except Exception as e:
-                            logger.warning(f"Batch get_order_books retry exhausted: {e}")
-
+                tokens_has_fetched: set[str] = set()
                 active_trades = state.get_active_trades()
                 for a in asset_ids:
+                    if a in tokens_has_fetched:
+                        continue
+                    da = get_min_ask_data(a, allow_price_fallback=True)
+                    pa = float(da.get("min_ask_price", 0)) if da else 0
+                    tokens_has_fetched.add(a)
                     b = state.get_asset_pair(a)
-                    if not _pair_processed_once(a, b):
+                    db = get_min_ask_data(b, allow_price_fallback=True)
+                    pb = float(db.get("min_ask_price", 0)) if db else 0
+                    tokens_has_fetched.add(b)
+                    if pa <= 0 or pb <= 0:
                         continue
-                    if not b:
-                        continue
-                    logger.debug(f"🔍 Scan #{scan_count} | Pair {a}↔{b}")
-                    try:
-                        # 优先用批量订单簿最优卖价，缺失时降级到单资产获取
-                        pa = None
-                        pb = None
-                        book_a = books_map.get(a)
-                        if book_a and getattr(book_a, 'asks', None):
-                            try:
-                                pa = min((float(x.price) for x in book_a.asks if x and hasattr(x, 'price')), default=None)
-                            except Exception:
-                                pa = None
-                        book_b = books_map.get(b)
-                        if book_b and getattr(book_b, 'asks', None):
-                            try:
-                                pb = min((float(x.price) for x in book_b.asks if x and hasattr(x, 'price')), default=None)
-                            except Exception:
-                                pb = None
-
-                        if pa is None:
-                            da = get_min_ask_data(a, allow_price_fallback=True)
-                            pa = float(da.get("min_ask_price", 0)) if da else 0
-                        if pb is None:
-                            db = get_min_ask_data(b, allow_price_fallback=True)
-                            pb = float(db.get("min_ask_price", 0)) if db else 0
-                        if pa <= 0 or pb <= 0:
-                            continue
-                        s = pa + pb
-                        logger.debug(f"Pair {a}↔{b} | best_asks={pa} {pb}")
-                        logger.debug(f"Pair {a}↔{b} | best_asks_sum={s:.4f}")
-                        # 实时打印最佳卖价（可卖出的最佳价格）及其汇总
-
-                        if s < ARB_ENTRY_SUM_THRESHOLD:
-                            # Require capacity for two trades
-                            if len(active_trades) + 2 > MAX_CONCURRENT_TRADES:
-                                logger.debug(
-                                    f"⛔ Skip entry for pair {a}↔{b}: active_trades would exceed limit"
-                                )
-                                continue
-
-                            # Skip if either side is recently traded to avoid churn
-                            if is_recently_bought(state, a) or is_recently_bought(state, b):
-                                continue
-
-                            logger.info(
-                                f"🟡 Pair Mispricing Detected | {a}+{b} best_asks_sum={s:.4f} < {ARB_ENTRY_SUM_THRESHOLD:.4f} | buy both"
+                    s = pa + pb
+                    logger.info(f"Pair {a}↔{b} | best_asks={pa} {pb}")
+                    logger.info(f"Pair {a}↔{b} | best_asks_sum={s:.4f}")
+                    # 实时打印最佳卖价（可卖出的最佳价格）及其汇总
+                    if s < ARB_ENTRY_SUM_THRESHOLD:
+                        # Require capacity for two trades
+                        if len(active_trades) + 2 > MAX_CONCURRENT_TRADES:
+                            logger.debug(
+                                f"⛔ Skip entry for pair {a}↔{b}: active_trades would exceed limit"
                             )
+                            continue
 
-                            ok_a = place_buy_order(state, a, "Pair-sum arbitrage entry")
-                            ok_b = place_buy_order(state, b, "Pair-sum arbitrage entry")
+                        # Skip if either side is recently traded to avoid churn
+                        if is_recently_bought(state, a) or is_recently_bought(state, b):
+                            continue
 
-                            if ok_a and ok_b:
-                                logger.info(
-                                    f"✅ Entered pair {a} & {b} | best_asks=({pa:.4f}, {pb:.4f}) sum={s:.4f}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"⚠️ Partial entry for pair {a} & {b} (ok_a={ok_a}, ok_b={ok_b}); will manage via exits"
-                                )
+                        logger.info(
+                            f"🟡 Pair Mispricing Detected | {a}+{b} best_asks_sum={s:.4f} < {ARB_ENTRY_SUM_THRESHOLD:.4f} | buy both"
+                        )
 
-                    except Exception as e:
-                        logger.error(f"❌ Error evaluating pair {a}↔{b}: {e}")
-                        continue
+                        ok_a = place_buy_order(state, a, "Pair-sum arbitrage entry")
+                        ok_b = place_buy_order(state, b, "Pair-sum arbitrage entry")
 
+                        if ok_a and ok_b:
+                            logger.info(
+                                f"✅ Entered pair {a} & {b} | best_asks=({pa:.4f}, {pb:.4f}) sum={s:.4f}"
+                            )
+                        else:
+                            logger.warning(
+                                f"⚠️ Partial entry for pair {a} & {b} (ok_a={ok_a}, ok_b={ok_b}); will manage via exits"
+                            )
         except Exception as e:
             logger.error(f"❌ Error in detect_pair_sum_arbitrage: {e}")
             time.sleep(1)
+
 
 def check_pair_sum_arbitrage_exits(state: ThreadSafeState) -> None:
     last_log_time = time.time()
@@ -335,7 +318,7 @@ def check_pair_sum_arbitrage_exits(state: ThreadSafeState) -> None:
             now = time.time()
             if now - last_log_time >= 30:
                 logger.info(
-                    f"📈 Arbitrage Exit Check | Pairs: {len(asset_ids)//2} | Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"📈 Arbitrage Exit Check | Pairs: {len(asset_ids) // 2} | Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
                 )
                 last_log_time = now
 
@@ -355,20 +338,28 @@ def check_pair_sum_arbitrage_exits(state: ThreadSafeState) -> None:
                 tokens_list = list(tokens_to_fetch)
                 cache_map, cache_ts = state.get_order_books_cache()
                 use_cache = False
-                if ORDERBOOK_CACHE_ENABLED and state.is_order_books_cache_valid(ORDERBOOK_CACHE_TTL):
+                if ORDERBOOK_CACHE_ENABLED and state.is_order_books_cache_valid(
+                    ORDERBOOK_CACHE_TTL
+                ):
                     if all(t in cache_map for t in tokens_list):
                         books_map = {tid: cache_map.get(tid) for tid in tokens_list}
                         use_cache = True
                         age_ms = (time.time() - cache_ts) * 1000.0
-                        logger.debug(f"📚 Using cached order books (exit) | age={age_ms:.0f}ms | tokens={len(tokens_list)}")
+                        logger.debug(
+                            f"📚 Using cached order books (exit) | age={age_ms:.0f}ms | tokens={len(tokens_list)}"
+                        )
                 if not use_cache:
                     try:
                         books_list = get_order_books_with_retry(tokens_list)
-                        books_map = {tid: book for tid, book in zip(tokens_list, books_list)}
+                        books_map = {
+                            tid: book for tid, book in zip(tokens_list, books_list)
+                        }
                         if ORDERBOOK_CACHE_ENABLED:
                             state.set_order_books_cache(books_map)
                     except Exception as e:
-                        logger.warning(f"Batch get_order_books retry exhausted (exit): {e}")
+                        logger.warning(
+                            f"Batch get_order_books retry exhausted (exit): {e}"
+                        )
 
             for a in asset_ids:
                 b = state.get_asset_pair(a)
@@ -382,15 +373,29 @@ def check_pair_sum_arbitrage_exits(state: ThreadSafeState) -> None:
                     qa = None
                     qb = None
                     book_a = books_map.get(a)
-                    if book_a and getattr(book_a, 'bids', None):
+                    if book_a and getattr(book_a, "bids", None):
                         try:
-                            qa = max((float(x.price) for x in book_a.bids if x and hasattr(x, 'price')), default=None)
+                            qa = max(
+                                (
+                                    float(x.price)
+                                    for x in book_a.bids
+                                    if x and hasattr(x, "price")
+                                ),
+                                default=None,
+                            )
                         except Exception:
                             qa = None
                     book_b = books_map.get(b)
-                    if book_b and getattr(book_b, 'bids', None):
+                    if book_b and getattr(book_b, "bids", None):
                         try:
-                            qb = max((float(x.price) for x in book_b.bids if x and hasattr(x, 'price')), default=None)
+                            qb = max(
+                                (
+                                    float(x.price)
+                                    for x in book_b.bids
+                                    if x and hasattr(x, "price")
+                                ),
+                                default=None,
+                            )
                         except Exception:
                             qb = None
 
@@ -421,7 +426,9 @@ def check_pair_sum_arbitrage_exits(state: ThreadSafeState) -> None:
                         continue
 
                     # 新退出条件：当前卖出价之和 > 买入均价之和
-                    entry_sum = float(getattr(pos_a, 'avg_price', 0) or 0) + float(getattr(pos_b, 'avg_price', 0) or 0)
+                    entry_sum = float(getattr(pos_a, "avg_price", 0) or 0) + float(
+                        getattr(pos_b, "avg_price", 0) or 0
+                    )
                     if s > entry_sum:
                         logger.info(
                             f"🎯 Pair Exit | {a}+{b} sell_sum={s:.4f} > entry_sum={entry_sum:.4f} | selling both"
@@ -490,9 +497,7 @@ def print_positions_realtime(state: ThreadSafeState) -> None:
                     # 防御型：单条异常不影响整体输出
                     continue
 
-        header = (
-            f"📒 持仓快照 | 数量={total_positions} | 总价值=${agg_current_value:.2f} | 未实现PnL=${agg_unrealized_pnl:.2f} | 已实现PnL=${agg_realized_pnl:.2f}"
-        )
+        header = f"📒 持仓快照 | 数量={total_positions} | 总价值=${agg_current_value:.2f} | 未实现PnL=${agg_unrealized_pnl:.2f} | 已实现PnL=${agg_realized_pnl:.2f}"
         logger.info(header)
         for ln in lines:
             logger.info(ln)
@@ -501,8 +506,7 @@ def print_positions_realtime(state: ThreadSafeState) -> None:
         try:
             # 事件触发优先：有价格更新立即尝试打印（节流）
             triggered = price_update_event.wait(timeout=1.0)
-            if triggered:
-                price_update_event.clear()
+            # 注意：不要在打印线程中清除事件，避免与检测线程竞争导致其错过触发
 
             now = time.time()
             if now - last_print_time >= throttle_seconds:

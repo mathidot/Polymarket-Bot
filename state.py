@@ -2,7 +2,7 @@ import time
 import logging
 from typing import Dict, List, Tuple, Optional
 from collections import deque, defaultdict
-from threading import Lock, Event
+from threading import Lock, Event, RLock
 
 from models import TradeInfo, PositionInfo, TradeType, ValidationError
 from config import PRICE_HISTORY_SIZE, KEEP_MIN_SHARES, SIMULATION_MODE, SIM_START_USDC
@@ -22,7 +22,8 @@ class ThreadSafeState:
     ):
         self._price_history_lock = Lock()
         self._active_trades_lock = Lock()
-        self._positions_lock = Lock()
+        # 使用可重入锁以避免在持仓更新中嵌套调用导致死锁
+        self._positions_lock = RLock()
         self._asset_pairs_lock = Lock()
         self._recent_trades_lock = Lock()
         self._last_trade_closed_at_lock = Lock()

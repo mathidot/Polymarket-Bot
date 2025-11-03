@@ -105,13 +105,19 @@ def main() -> None:
         spinner = Halo(text=spinner_text, spinner="dots")
         spinner.start()
         time.sleep(1)
-        logger.info(f"🚀 Spike-detection bot started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(
+            f"🚀 Spike-detection bot started at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
         if INIT_PAIR_MODE == "markets":
-            logger.info(f"🔧 Pair Mode: markets | market_fetch_limit={MARKET_FETCH_LIMIT}")
+            logger.info(
+                f"🔧 Pair Mode: markets | market_fetch_limit={MARKET_FETCH_LIMIT}"
+            )
             logger.info("💡 Tip: adjust 'market_fetch_limit' in .env to control scope")
         elif INIT_PAIR_MODE == "config":
-            logger.info(f"🔧 Pair Mode: config | config_asset_pairs='{CONFIG_ASSET_PAIRS}'")
+            logger.info(
+                f"🔧 Pair Mode: config | config_asset_pairs='{CONFIG_ASSET_PAIRS}'"
+            )
             logger.info("💡 Format: config_asset_pairs=idA:idB,idC:idD (token IDs)")
 
         if not market_init.wait_for_initialization(state):
@@ -125,7 +131,9 @@ def main() -> None:
             try:
                 applied = market_init.load_sim_positions_from_config(state)
                 if applied > 0:
-                    logger.info(f"[SIM] Loaded {applied} initial simulated positions from .env")
+                    logger.info(
+                        f"[SIM] Loaded {applied} initial simulated positions from .env"
+                    )
                 else:
                     logger.info("[SIM] No initial simulated positions to load")
             except Exception as e:
@@ -133,12 +141,10 @@ def main() -> None:
 
         thread_targets = {
             "price_update": pricing.update_price_history,
-            # Use pair-sum arbitrage strategy (Yes+No sum≈1). Enters when sum<entry, exits when sum>exit.
-            "detect_trade": strategy.detect_pair_sum_arbitrage,
-            # Pair-sum exits for two-sided positions
-            "check_exits": strategy.check_pair_sum_arbitrage_exits,
-            # Generic risk exits (take profit / stop loss / holding time) for single-side entries
-            "risk_exits": strategy.check_trade_exits,
+            # Spike detection strategy
+            "detect_trade": strategy.detect_and_trade,
+            # Risk exits (take profit / stop loss / holding time)
+            "check_exits": strategy.check_trade_exits,
             # Real-time holdings snapshot printer
             "positions_log": strategy.print_positions_realtime,
         }
@@ -149,7 +155,10 @@ def main() -> None:
         logger.info("⏳ Waiting for initial price data...")
         initial_data_wait = 0
         while initial_data_wait < 30 and not state.is_shutdown():
-            if any(state.get_price_history(aid) for aid in list(state._price_history.keys())):
+            if any(
+                state.get_price_history(aid)
+                for aid in list(state._price_history.keys())
+            ):
                 logger.info("✅ Initial price data received")
                 break
             time.sleep(1)
@@ -165,7 +174,6 @@ def main() -> None:
         logger.info("🔄 Starting trading threads...")
         thread_manager.start_thread("detect_trade", thread_targets["detect_trade"])
         thread_manager.start_thread("check_exits", thread_targets["check_exits"])
-        thread_manager.start_thread("risk_exits", thread_targets["risk_exits"])
         thread_manager.start_thread("positions_log", thread_targets["positions_log"])
 
         last_refresh_time = time.time()
@@ -177,28 +185,36 @@ def main() -> None:
                 current_time = time.time()
 
                 if current_time - last_status_time >= 30:
-                    active_threads = sum(1 for t in thread_manager.threads.values() if t.is_alive())
+                    active_threads = sum(
+                        1 for t in thread_manager.futures.values() if t.running()
+                    )
                     logger.info(
-                        f"📊 Bot Status | Active Threads: {active_threads}/5 | Price Updates: {len(state._price_history)}"
+                        f"📊 Bot Status | Active Threads: {active_threads}/4 | Price Updates: {len(state._price_history)}"
                     )
                     last_status_time = current_time
 
-                if not SIMULATION_MODE and (current_time - last_refresh_time > refresh_interval):
+                if not SIMULATION_MODE and (
+                    current_time - last_refresh_time > refresh_interval
+                ):
                     if api_mod.refresh_api_credentials():
                         last_refresh_time = current_time
                     else:
-                        logger.warning("⚠️ Failed to refresh API credentials. Will retry in 5 minutes.")
+                        logger.warning(
+                            "⚠️ Failed to refresh API credentials. Will retry in 5 minutes."
+                        )
                         time.sleep(300)
                         continue
 
-                for name, thread in thread_manager.threads.items():
-                    if not thread.is_alive():
+                for name, future in thread_manager.futures.items():
+                    if not future.running():
                         logger.warning(f"⚠️ Thread {name} has died. Restarting...")
                         target = thread_targets.get(name)
                         if target is not None:
                             thread_manager.start_thread(name, target)
                         else:
-                            logger.error(f"❌ No target found for thread {name}; cannot restart.")
+                            logger.error(
+                                f"❌ No target found for thread {name}; cannot restart."
+                            )
 
                 time.sleep(1)
 
