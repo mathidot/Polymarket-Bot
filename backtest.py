@@ -183,7 +183,7 @@ def run_backtest(
         raise ValueError("请提供 --csv 或同时提供 --csv_yes 与 --csv_no")
 
     # 启动策略相关线程（与 main.py 保持一致的目标函数）
-    tm.start_thread("detect_trade", strategy.detect_and_trade)
+    tm.start_thread("detect_trade", strategy.detect_and_trade_trend_ma)
     tm.start_thread("check_exits", strategy.check_trade_exits)
     tm.start_thread("positions_log", strategy.print_positions_realtime)
 

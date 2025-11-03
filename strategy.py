@@ -32,6 +32,81 @@ from trading import (
 logger = logging.getLogger("polymarket_bot")
 
 
+# --- Trend computation helpers ---
+def _extract_prices(history, lookback: Optional[int] = None):
+    window = history[-lookback:] if (lookback and len(history) >= lookback) else history
+    prices = [float(item[1]) for item in window if item and item[1] is not None]
+    return prices
+
+
+def compute_delta_simple(history) -> float:
+    prices = _extract_prices(history)
+    if len(prices) < 2:
+        return 0.0
+    base, last = prices[0], prices[-1]
+    if base <= 0 or last <= 0:
+        return 0.0
+    return (last - base) / base
+
+
+def compute_trend_delta_ma(history, lookback: int = 20) -> float:
+    prices = _extract_prices(history, lookback)
+    if len(prices) < 2 or min(prices) <= 0.0:
+        return 0.0
+    half = max(1, len(prices) // 2)
+    left_mean = sum(prices[:half]) / float(half)
+    right_len = max(1, len(prices) - half)
+    right_mean = sum(prices[half:]) / float(right_len)
+    if left_mean <= 0:
+        return 0.0
+    return (right_mean - left_mean) / left_mean
+
+
+def compute_trend_delta_reg(history, lookback: int = 20) -> float:
+    prices = _extract_prices(history, lookback)
+    if len(prices) < 2 or min(prices) <= 0.0:
+        return 0.0
+    n = len(prices)
+    xs = list(range(n))
+    mean_x = sum(xs) / float(n)
+    mean_y = sum(prices) / float(n)
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    if var_x == 0:
+        return 0.0
+    cov_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, prices))
+    slope = cov_xy / var_x
+    base = prices[0]
+    if base <= 0:
+        return 0.0
+    return (slope * n) / base
+
+
+def compute_trend_delta_ema(history, lookback: int = 20, span: int = 10) -> float:
+    prices = _extract_prices(history, lookback)
+    if len(prices) < 2 or min(prices) <= 0.0:
+        return 0.0
+    alpha = 2.0 / (span + 1.0)
+    ema = prices[0]
+    for p in prices[1:]:
+        ema = alpha * p + (1 - alpha) * ema
+    base = prices[0]
+    if base <= 0:
+        return 0.0
+    return (ema - base) / base
+
+
+def compute_trend_delta(history, lookback: int = 20, method: str = "ma", **kwargs) -> float:
+    m = str(method).lower()
+    if m in ("ma", "ma_delta"):
+        return compute_trend_delta_ma(history, lookback)
+    if m in ("reg", "reg_slope", "lr", "ols"):
+        return compute_trend_delta_reg(history, lookback)
+    if m in ("ema", "ema_delta"):
+        span = int(kwargs.get("span", 10))
+        return compute_trend_delta_ema(history, lookback, span=span)
+    return compute_delta_simple(history)
+
+
 def detect_and_trade(state: ThreadSafeState) -> None:
     last_log_time = time.time()
     scan_count = 0
@@ -144,6 +219,334 @@ def detect_and_trade(state: ThreadSafeState) -> None:
             logger.error(f"❌ Error in detect_and_trade: {str(e)}")
             time.sleep(0.5)
 
+
+def detect_and_trade_trend_ma(state: ThreadSafeState) -> None:
+    last_log_time = time.time()
+    scan_count = 0
+
+    while not state.is_shutdown():
+        try:
+            if price_update_event.wait(timeout=0.2):
+                price_update_event.clear()
+
+                if not any(
+                    state.get_price_history(asset_id)
+                    for asset_id in state._price_history.keys()
+                ):
+                    continue
+
+                positions_copy = state.get_positions()
+                scan_count += 1
+
+                current_time = time.time()
+                if current_time - last_log_time >= 5:
+                    logger.info(
+                        f"🔍 [MA] Scanning Markets | Scan #{scan_count} | Active Positions: {len(positions_copy)}"
+                    )
+                    last_log_time = current_time
+
+                for asset_id in list(state._price_history.keys()):
+                    try:
+                        history = state.get_price_history(asset_id)
+                        if len(history) < 2:
+                            continue
+
+                        old_price = history[0][1]
+                        new_price = history[-1][1]
+                        if old_price == 0 or new_price == 0:
+                            continue
+
+                        delta = compute_trend_delta(history, lookback=20, method="ma")
+                        if delta > SPIKE_THRESHOLD_UP:
+                            if new_price < 0.20 or new_price > 0.80:
+                                continue
+                            place_buy_order(state, asset_id, "MA trend spike")
+
+                        if delta < -SPIKE_THRESHOLD_DOWN:
+                            try:
+                                positions_copy_local = state.get_positions()
+                                position = find_position_by_asset(positions_copy_local, asset_id)
+                                if position:
+                                    place_sell_order(state, asset_id, "MA downward spike")
+                            except Exception:
+                                pass
+
+                        try:
+                            positions_copy_local = state.get_positions()
+                            position = find_position_by_asset(positions_copy_local, asset_id)
+                            if position:
+                                bid_data = get_max_bid_data(asset_id, allow_price_fallback=True)
+                                current_sellable = None
+                                if bid_data and bid_data.get("max_bid_price") is not None:
+                                    current_sellable = float(bid_data.get("max_bid_price"))
+                                else:
+                                    current_sellable = float(new_price)
+
+                                avg_price = float(position.avg_price)
+                                cash_profit = (current_sellable - avg_price) * float(position.shares)
+                                pct_profit = ((current_sellable - avg_price) / avg_price) if avg_price > 0 else 0.0
+
+                                if cash_profit >= CASH_PROFIT or pct_profit >= PCT_PROFIT:
+                                    place_sell_order(state, asset_id, "MA instant take profit")
+                                if cash_profit <= CASH_LOSS or pct_profit <= PCT_LOSS:
+                                    place_sell_order(state, asset_id, "MA instant stop loss")
+                        except Exception:
+                            pass
+
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"❌ Error in detect_and_trade_trend_ma: {str(e)}")
+            time.sleep(0.5)
+
+
+def detect_and_trade_trend_reg(state: ThreadSafeState) -> None:
+    last_log_time = time.time()
+    scan_count = 0
+
+    while not state.is_shutdown():
+        try:
+            if price_update_event.wait(timeout=0.2):
+                price_update_event.clear()
+
+                if not any(
+                    state.get_price_history(asset_id)
+                    for asset_id in state._price_history.keys()
+                ):
+                    continue
+
+                positions_copy = state.get_positions()
+                scan_count += 1
+
+                current_time = time.time()
+                if current_time - last_log_time >= 5:
+                    logger.info(
+                        f"🔍 [REG] Scanning Markets | Scan #{scan_count} | Active Positions: {len(positions_copy)}"
+                    )
+                    last_log_time = current_time
+
+                for asset_id in list(state._price_history.keys()):
+                    try:
+                        history = state.get_price_history(asset_id)
+                        if len(history) < 2:
+                            continue
+
+                        old_price = history[0][1]
+                        new_price = history[-1][1]
+                        if old_price == 0 or new_price == 0:
+                            continue
+
+                        delta = compute_trend_delta(history, lookback=20, method="reg")
+                        if delta > SPIKE_THRESHOLD_UP:
+                            if new_price < 0.20 or new_price > 0.80:
+                                continue
+                            place_buy_order(state, asset_id, "REG trend spike")
+
+                        if delta < -SPIKE_THRESHOLD_DOWN:
+                            try:
+                                positions_copy_local = state.get_positions()
+                                position = find_position_by_asset(positions_copy_local, asset_id)
+                                if position:
+                                    place_sell_order(state, asset_id, "REG downward spike")
+                            except Exception:
+                                pass
+
+                        try:
+                            positions_copy_local = state.get_positions()
+                            position = find_position_by_asset(positions_copy_local, asset_id)
+                            if position:
+                                bid_data = get_max_bid_data(asset_id, allow_price_fallback=True)
+                                current_sellable = None
+                                if bid_data and bid_data.get("max_bid_price") is not None:
+                                    current_sellable = float(bid_data.get("max_bid_price"))
+                                else:
+                                    current_sellable = float(new_price)
+
+                                avg_price = float(position.avg_price)
+                                cash_profit = (current_sellable - avg_price) * float(position.shares)
+                                pct_profit = ((current_sellable - avg_price) / avg_price) if avg_price > 0 else 0.0
+
+                                if cash_profit >= CASH_PROFIT or pct_profit >= PCT_PROFIT:
+                                    place_sell_order(state, asset_id, "REG instant take profit")
+                                if cash_profit <= CASH_LOSS or pct_profit <= PCT_LOSS:
+                                    place_sell_order(state, asset_id, "REG instant stop loss")
+                        except Exception:
+                            pass
+
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"❌ Error in detect_and_trade_trend_reg: {str(e)}")
+            time.sleep(0.5)
+
+
+def detect_and_trade_trend_ema(state: ThreadSafeState) -> None:
+    last_log_time = time.time()
+    scan_count = 0
+
+    while not state.is_shutdown():
+        try:
+            if price_update_event.wait(timeout=0.2):
+                price_update_event.clear()
+
+                if not any(
+                    state.get_price_history(asset_id)
+                    for asset_id in state._price_history.keys()
+                ):
+                    continue
+
+                positions_copy = state.get_positions()
+                scan_count += 1
+
+                current_time = time.time()
+                if current_time - last_log_time >= 5:
+                    logger.info(
+                        f"🔍 [EMA] Scanning Markets | Scan #{scan_count} | Active Positions: {len(positions_copy)}"
+                    )
+                    last_log_time = current_time
+
+                for asset_id in list(state._price_history.keys()):
+                    try:
+                        history = state.get_price_history(asset_id)
+                        if len(history) < 2:
+                            continue
+
+                        old_price = history[0][1]
+                        new_price = history[-1][1]
+                        if old_price == 0 or new_price == 0:
+                            continue
+
+                        delta = compute_trend_delta(history, lookback=24, method="ema", span=8)
+                        if delta > SPIKE_THRESHOLD_UP:
+                            if new_price < 0.20 or new_price > 0.80:
+                                continue
+                            place_buy_order(state, asset_id, "EMA trend spike")
+
+                        if delta < -SPIKE_THRESHOLD_DOWN:
+                            try:
+                                positions_copy_local = state.get_positions()
+                                position = find_position_by_asset(positions_copy_local, asset_id)
+                                if position:
+                                    place_sell_order(state, asset_id, "EMA downward spike")
+                            except Exception:
+                                pass
+
+                        try:
+                            positions_copy_local = state.get_positions()
+                            position = find_position_by_asset(positions_copy_local, asset_id)
+                            if position:
+                                bid_data = get_max_bid_data(asset_id, allow_price_fallback=True)
+                                current_sellable = None
+                                if bid_data and bid_data.get("max_bid_price") is not None:
+                                    current_sellable = float(bid_data.get("max_bid_price"))
+                                else:
+                                    current_sellable = float(new_price)
+
+                                avg_price = float(position.avg_price)
+                                cash_profit = (current_sellable - avg_price) * float(position.shares)
+                                pct_profit = ((current_sellable - avg_price) / avg_price) if avg_price > 0 else 0.0
+
+                                if cash_profit >= CASH_PROFIT or pct_profit >= PCT_PROFIT:
+                                    place_sell_order(state, asset_id, "EMA instant take profit")
+                                if cash_profit <= CASH_LOSS or pct_profit <= PCT_LOSS:
+                                    place_sell_order(state, asset_id, "EMA instant stop loss")
+                        except Exception:
+                            pass
+
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"❌ Error in detect_and_trade_trend_ema: {str(e)}")
+            time.sleep(0.5)
+
+
+def detect_and_trade_breakout(state: ThreadSafeState) -> None:
+    last_log_time = time.time()
+    scan_count = 0
+    lookback = 20
+
+    while not state.is_shutdown():
+        try:
+            if price_update_event.wait(timeout=0.2):
+                price_update_event.clear()
+
+                if not any(
+                    state.get_price_history(asset_id)
+                    for asset_id in state._price_history.keys()
+                ):
+                    continue
+
+                positions_copy = state.get_positions()
+                scan_count += 1
+
+                current_time = time.time()
+                if current_time - last_log_time >= 5:
+                    logger.info(
+                        f"🔍 [BRK] Scanning Markets | Scan #{scan_count} | Active Positions: {len(positions_copy)}"
+                    )
+                    last_log_time = current_time
+
+                for asset_id in list(state._price_history.keys()):
+                    try:
+                        history = state.get_price_history(asset_id)
+                        if len(history) < 2:
+                            continue
+
+                        window = history[-lookback:] if len(history) >= lookback else history
+                        prices = [float(h[1]) for h in window if h and h[1] is not None]
+                        if len(prices) < 2:
+                            continue
+                        if min(prices) <= 0.0:
+                            continue
+
+                        new_price = prices[-1]
+                        max_price = max(prices[:-1]) if len(prices) > 1 else prices[0]
+                        min_price = min(prices[:-1]) if len(prices) > 1 else prices[0]
+
+                        breakout_up = (new_price - max_price) / max_price if max_price > 0 else 0.0
+                        breakout_down = (min_price - new_price) / min_price if min_price > 0 else 0.0
+
+                        if breakout_up > SPIKE_THRESHOLD_UP:
+                            if new_price < 0.20 or new_price > 0.80:
+                                continue
+                            place_buy_order(state, asset_id, "Breakout up")
+
+                        if breakout_down > SPIKE_THRESHOLD_DOWN:
+                            try:
+                                positions_copy_local = state.get_positions()
+                                position = find_position_by_asset(positions_copy_local, asset_id)
+                                if position:
+                                    place_sell_order(state, asset_id, "Breakdown stop")
+                            except Exception:
+                                pass
+
+                        try:
+                            positions_copy_local = state.get_positions()
+                            position = find_position_by_asset(positions_copy_local, asset_id)
+                            if position:
+                                bid_data = get_max_bid_data(asset_id, allow_price_fallback=True)
+                                current_sellable = None
+                                if bid_data and bid_data.get("max_bid_price") is not None:
+                                    current_sellable = float(bid_data.get("max_bid_price"))
+                                else:
+                                    current_sellable = float(new_price)
+
+                                avg_price = float(position.avg_price)
+                                cash_profit = (current_sellable - avg_price) * float(position.shares)
+                                pct_profit = ((current_sellable - avg_price) / avg_price) if avg_price > 0 else 0.0
+
+                                if cash_profit >= CASH_PROFIT or pct_profit >= PCT_PROFIT:
+                                    place_sell_order(state, asset_id, "Breakout take profit")
+                                if cash_profit <= CASH_LOSS or pct_profit <= PCT_LOSS:
+                                    place_sell_order(state, asset_id, "Breakout stop loss")
+                        except Exception:
+                            pass
+
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"❌ Error in detect_and_trade_breakout: {str(e)}")
+            time.sleep(0.5)
 
 def check_trade_exits(state: ThreadSafeState) -> None:
     last_log_time = time.time()
