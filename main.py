@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from web3 import Web3
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 from typing import Dict, List, Tuple, Optional, Any, Union
 from collections import deque, defaultdict
@@ -143,6 +143,8 @@ COOLDOWN_PERIOD = int(os.getenv("cooldown_period"))
 KEEP_MIN_SHARES = int(os.getenv("keep_min_shares"))
 MAX_CONCURRENT_TRADES = int(os.getenv("max_concurrent_trades"))
 MIN_LIQUIDITY_REQUIREMENT = float(os.getenv("min_liquidity_requirement"))
+PRICE_LOWER_BOUND = float(os.getenv("price_lower_bound", "0.20"))
+PRICE_UPPER_BOUND = float(os.getenv("price_upper_bound", "0.80"))
 # Web3 and API setup
 WEB3_PROVIDER = "https://polygon-rpc.com"
 YOUR_PROXY_WALLET = Web3.to_checksum_address(os.getenv("YOUR_PROXY_WALLET"))
@@ -150,6 +152,8 @@ BOT_TRADER_ADDRESS = Web3.to_checksum_address(os.getenv("BOT_TRADER_ADDRESS"))
 USDC_CONTRACT_ADDRESS = os.getenv("USDC_CONTRACT_ADDRESS")
 POLYMARKET_SETTLEMENT_CONTRACT = os.getenv("POLYMARKET_SETTLEMENT_CONTRACT")
 PRIVATE_KEY = os.getenv("PK")
+USE_ONCHAIN_APPROVE = os.getenv("USE_ONCHAIN_APPROVE", "false").lower() == "true"
+USE_CHAIN_BALANCE_CHECK = os.getenv("USE_CHAIN_BALANCE_CHECK", "false").lower() == "true"
 
 web3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER))
 # Setup logging
@@ -470,7 +474,7 @@ def initialize_clob_client(max_retries: int = 3) -> ClobClient:
                 host="https://clob.polymarket.com",
                 key=PRIVATE_KEY,
                 chain_id=137,
-                signature_type=2,
+                signature_type=1,
                 funder=YOUR_PROXY_WALLET
             )
             api_creds = client.create_or_derive_api_creds()
@@ -563,57 +567,24 @@ def fetch_positions_with_retry(max_retries: int = MAX_RETRIES) -> Dict[str, List
     
     raise NetworkError("Failed to fetch positions after maximum retries")
 
-def ensure_usdc_allowance(required_amount: float) -> bool:
-    """Ensure USDC allowance with proper error handling"""
-    max_retries = MAX_RETRIES
-    base_delay = BASE_DELAY
-    
-    for attempt in range(max_retries):
+def check_usdc_allowance(required_amount: float) -> bool:
+    try:
+        collateral = client.get_balance_allowance(
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        current_balance = collateral.get('balance', 0)
         try:
-            contract = web3.eth.contract(address=USDC_CONTRACT_ADDRESS, abi=[
-                {"constant": True, "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
-                 "name": "allowance", "outputs": [{"name": "", "type": "uint256"}],
-                 "payable": False, "stateMutability": "view", "type": "function"},
-                {"constant": False, "inputs": [{"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}],
-                 "name": "approve", "outputs": [{"name": "", "type": "bool"}],
-                 "payable": False, "stateMutability": "nonpayable", "type": "function"}
-            ])
-
-            current_allowance = contract.functions.allowance(BOT_TRADER_ADDRESS , POLYMARKET_SETTLEMENT_CONTRACT).call()
-            logger.info(f"current_allowance: {current_allowance}")
-            required_amount_with_buffer = int(required_amount * 1.1 * 10**6)
-            
-            if current_allowance >= required_amount_with_buffer:
-                return True
-
-            logger.info(f"🔄 Approving USDC allowance... (attempt {attempt + 1}/{max_retries})")
-            
-            new_allowance = max(current_allowance, required_amount_with_buffer)
-            logger.info(f"new_allowance: {new_allowance}")
-            txn = contract.functions.approve(POLYMARKET_SETTLEMENT_CONTRACT, new_allowance).build_transaction({
-                "from": BOT_TRADER_ADDRESS,
-                "gas": 200000,
-                "gasPrice": web3.eth.gas_price,
-                "nonce": web3.eth.get_transaction_count(BOT_TRADER_ADDRESS),
-                "chainId": 137
-            })
-            
-            signed_txn = web3.eth.account.sign_transaction(txn, private_key=PRIVATE_KEY)
-            tx_hash = web3.eth.send_raw_transaction(signed_txn.raw_transaction)
-            receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-            
-            if receipt.status == 1:
-                logger.info(f"✅ USDC allowance updated: {tx_hash.hex()}")
-                return True
-            else:
-                raise TradingError(f"USDC allowance update failed: {tx_hash.hex()}")
-                
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise TradingError(f"Failed to update USDC allowance: {e}")
-            logger.error(f"⚠️ Error in USDC allowance update (attempt {attempt + 1}): {e}")
-            time.sleep(base_delay * (2 ** attempt))
-    
+            current_balance = float(current_balance)
+        except (TypeError, ValueError):
+            current_balance = 0.0
+        try:
+            required = float(required_amount)
+        except (TypeError, ValueError):
+            required = 0.0
+        if current_balance >= required:
+            return True
+    except Exception as e:
+        raise TradingError(f"Failed to update USDC allowance: {e}")
     return False
 
 def refresh_api_credentials() -> bool:
@@ -667,26 +638,6 @@ def get_max_bid_data(asset: str) -> Optional[Dict[str, Any]]:
         logger.error(f"❌ Failed to get bid data for {asset}: {str(e)}")
         return None
 
-def check_usdc_balance(usdc_needed: float) -> bool:
-    try:
-        usdc_contract = web3.eth.contract(address=USDC_CONTRACT_ADDRESS, abi=[
-            {"constant": True, "inputs": [{"name": "account", "type": "address"}],
-             "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
-             "payable": False, "stateMutability": "view", "type": "function"}
-        ])
-        usdc_balance = usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
-        
-        logger.info(f"💵 USDC Balance: ${usdc_balance:.2f}, Required: ${usdc_needed:.2f}")
-        
-        if usdc_balance < usdc_needed:
-            logger.warning(f"❌ Insufficient USDC balance. Required: ${usdc_needed:.2f}, Available: ${usdc_balance:.2f}")
-            return False
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ Failed to check USDC balance: {str(e)}")
-        return False
-
 @log_function_call(logger)
 def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
     try:
@@ -702,15 +653,18 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
             logger.warning(f"🔒 Maximum concurrent trades limit reached ({len(active_trades)}/{MAX_CONCURRENT_TRADES})")
             return False
 
-        # Check USDC balance and calculate position size
-        usdc_contract = web3.eth.contract(address=USDC_CONTRACT_ADDRESS, abi=[
-            {"constant": True, "inputs": [{"name": "account", "type": "address"}],
-             "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
-             "payable": False, "stateMutability": "view", "type": "function"}
-        ])
-        usdc_balance = usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
-        if not usdc_balance:
-            return False
+        # Optional USDC pre-check: only read on-chain balance if enabled
+        if USE_CHAIN_BALANCE_CHECK:
+            usdc_contract = web3.eth.contract(address=USDC_CONTRACT_ADDRESS, abi=[
+                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
+                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+                 "payable": False, "stateMutability": "view", "type": "function"}
+            ])
+            usdc_balance = usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
+            if not usdc_balance:
+                return False
+        else:
+            logger.info("⚙️ Skipping on-chain USDC balance pre-check; proceeding with CLOB order flow")
             
         
         max_retries = MAX_RETRIES
@@ -742,10 +696,7 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 # Calculate position size based on account balance
                 amount_in_dollars = min(TRADE_UNIT, min_ask_size * min_ask_price)
                 
-                if not check_usdc_balance(amount_in_dollars):
-                    raise TradingError(f"Insufficient USDC balance for {asset}")
-                
-                if not ensure_usdc_allowance(amount_in_dollars):
+                if not check_usdc_allowance(amount_in_dollars):
                     raise TradingError(f"Failed to ensure USDC allowance for {asset}")
 
                 order_args = MarketOrderArgs(
@@ -1061,7 +1012,7 @@ def detect_and_trade(state: ThreadSafeState) -> None:
                         delta = (new_price - old_price) / old_price
 
                         if abs(delta) > SPIKE_THRESHOLD:
-                            if new_price < 0.20 or new_price > 0.80:
+                            if new_price < PRICE_LOWER_BOUND or new_price > PRICE_UPPER_BOUND:
                                 continue
 
                             

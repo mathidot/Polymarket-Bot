@@ -72,6 +72,10 @@ BOT_TRADER_ADDRESS=your_trader_address
 USDC_CONTRACT_ADDRESS=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
 POLYMARKET_SETTLEMENT_CONTRACT=0x56C79347e95530c01A2FC76E732f9566dA16E113
 
+# On-Chain Toggles (API-only trading)
+USE_ONCHAIN_APPROVE=false
+USE_CHAIN_BALANCE_CHECK=false
+
 # Trading Parameters
 trade_unit=3.0
 slippage_tolerance=0.02
@@ -89,7 +93,7 @@ max_concurrent_trades=3
 min_liquidity_requirement=10.0
 ```
 
-## Configuration Parameters
+## 配置参数
 
 ### Wallet Settings
 - `PK`: Your wallet's private key
@@ -97,8 +101,10 @@ min_liquidity_requirement=10.0
 - `BOT_TRADER_ADDRESS`: Your MetaMask wallet address
 - `USDC_CONTRACT_ADDRESS`: USDC contract address on Polygon
 - `POLYMARKET_SETTLEMENT_CONTRACT`: Polymarket settlement contract address
+- `USE_ONCHAIN_APPROVE`: Set to `false` to skip on-chain USDC approve
+- `USE_CHAIN_BALANCE_CHECK`: Set to `false` to avoid on-chain balance reads
 
-### Trading Parameters
+### 交易参数
 - `trade_unit`: Base trade size in USDC
 - `slippage_tolerance`: Maximum allowed slippage (e.g., 0.02 for 2%)
 - `pct_profit`: Take profit threshold (e.g., 0.03 for 3%)
@@ -113,13 +119,15 @@ min_liquidity_requirement=10.0
 - `keep_min_shares`: Minimum shares to keep when selling
 - `max_concurrent_trades`: Maximum number of concurrent trades
 - `min_liquidity_requirement`: Minimum liquidity required to trade (USDC)
+- `price_lower_bound`: 尖刺检测后允许交易的价格下界（默认 0.20）
+- `price_upper_bound`: 尖刺检测后允许交易的价格上界（默认 0.80）
 
-## Running the Bot
+## 运行方式
 
-1. Ensure your `.env` file is properly configured
-2. Run the bot:
+- 确保 `.env` 已配置完整
+- 启动入口：
 ```bash
-python test.py
+python app.py
 ```
 
 ## Logging
@@ -156,26 +164,18 @@ This bot is for educational purposes only. Trading cryptocurrencies and predicti
 
 [Your License Here]
 
-## Bot Structure
+## 模块结构
 
 ![Bot Architecture Diagram](diagram.png)
 
-1. **State Management**
-   - Global variables for tracking trades and prices
-   - Price history management
-   - Active trade tracking
+`polymarket_bot/config.py`、`logger.py`、`exceptions.py`、`types.py`、`state.py`、`client.py`、`api.py`、`orderbook.py`、`pricing.py`、`trading.py`、`detection.py`、`threads.py` 与 `app.py`
 
-2. **Trading Logic**
-   - Price spike detection
-   - Order placement with retries
-   - Take-profit and stop-loss management
-   - USDC allowance management
+## 测试
 
-3. **Main Loop**
-   - Price updates
-   - Trade detection
-   - Position management
-   - API credential refresh
+使用内置 `unittest` 运行基础单元测试：
+```bash
+python -m unittest
+```
 
-## Contact ME
+## 联系方式
 [Telegram](https://t.me/trust4120)
