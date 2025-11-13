@@ -176,6 +176,3 @@ This bot is for educational purposes only. Trading cryptocurrencies and predicti
 ```bash
 python -m unittest
 ```
-
-## 联系方式
-[Telegram](https://t.me/trust4120)
