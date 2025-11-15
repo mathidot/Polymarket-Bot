@@ -2,10 +2,11 @@ import time
 from typing import Optional
 from .state import ThreadSafeState, price_update_event
 from .logger import logger
-from .api import fetch_positions_with_retry
 from .config import PRICE_LOWER_BOUND, PRICE_UPPER_BOUND, SPIKE_THRESHOLD, CASH_PROFIT, CASH_LOSS, PCT_PROFIT, PCT_LOSS, HOLDING_TIME_LIMIT
 from .trading import place_buy_order, place_sell_order
 from .pricing import get_current_price
+from .client import get_client
+from .slug_source import load_watchlist_slugs, resolve_tokens_from_watchlist
 
 def update_price_history(state: ThreadSafeState) -> None:
     last_log_time = time.time()
@@ -15,31 +16,53 @@ def update_price_history(state: ThreadSafeState) -> None:
         try:
             start_time = time.time()
             now = time.time()
-            positions = fetch_positions_with_retry()
-            if not positions:
-                time.sleep(5)
+            tokens = state.get_watchlist_tokens()
+            if not tokens:
+                time.sleep(1)
                 continue
-            state.update_positions(positions)
             price_updated = False
             current_time = time.time()
             price_updates = []
-            for event_id, assets in positions.items():
-                for asset in assets:
+            for token in tokens:
+                price = None
+                eventslug, outcome = state.get_token_meta(token)
+                for attempt in range(2):
                     try:
-                        eventslug = asset.eventslug
-                        outcome = asset.outcome
-                        asset_id = asset.asset
-                        price = asset.current_price
-                        if not asset_id:
-                            continue
-                        state.add_price(asset_id, now, price, eventslug, outcome)
-                        update_count += 1
-                        price_updated = True
-                        price_updates.append(f"                                               💸 {outcome} in {eventslug}: ${price:.4f}")
+                        cli = get_client()
+                        if cli is None:
+                            raise RuntimeError("ClobClient unavailable")
+                        order = cli.get_order_book(token)
+                        if order.bids and order.asks:
+                            max_bid_price = float(order.bids[-1].price)
+                            min_ask_price = float(order.asks[-1].price)
+                            price = (max_bid_price + min_ask_price) / 2.0
+                            break
                     except Exception:
+                        time.sleep(0.2)
                         continue
+                if price is None:
+                    for attempt in range(2):
+                        try:
+                            cli = get_client()
+                            if cli is None:
+                                raise RuntimeError("ClobClient unavailable")
+                            price = float(cli.get_price(token, "BUY"))
+                            break
+                        except Exception:
+                            time.sleep(0.2)
+                            continue
+                if price is None:
+                    logger.error(f"❌ Failed to fetch price for token {token}: retries exhausted")
+                    continue
+                state.add_price(token, now, float(price), eventslug or "", outcome or "")
+                update_count += 1
+                price_updated = True
+                price_updates.append(f"                                               💸 {outcome or ''} in {eventslug or ''} | token {token}: ${float(price):.4f}")
             if current_time - last_log_time >= 5:
-                logger.info("📊 Price Updates:\n" + "\n".join(price_updates))
+                if price_updates:
+                    logger.info("📊 Price Updates:\n" + "\n".join(price_updates))
+                else:
+                    logger.info(f"📊 Price Updates: none | tokens={len(tokens)}")
                 last_log_time = current_time
             if price_updated:
                 price_update_event.set()
@@ -65,11 +88,10 @@ def detect_and_trade(state: ThreadSafeState) -> None:
                 price_update_event.clear()
                 if not any(state.get_price_history(asset_id) for asset_id in state._price_history.keys()):
                     continue
-                positions_copy = state.get_positions()
                 scan_count += 1
                 current_time = time.time()
                 if current_time - last_log_time >= 5:
-                    logger.info(f"🔍 Scanning Markets | Scan #{scan_count} | Active Positions: {len(positions_copy)}")
+                    logger.info(f"🔍 Scanning Markets | Scan #{scan_count} | Tracked Assets: {len(state._price_history)}")
                     last_log_time = current_time
                 for asset_id in list(state._price_history.keys()):
                     try:
@@ -132,23 +154,15 @@ def check_trade_exits(state: ThreadSafeState) -> None:
                     last_log_time = current_time
             for asset_id, trade in active_trades.items():
                 try:
-                    positions_copy = state.get_positions()
-                    position = None
-                    for event_positions in positions_copy.values():
-                        for p in event_positions:
-                            if p.asset == asset_id:
-                                position = p
-                    if not position:
-                        continue
                     current_price = get_current_price(state, asset_id)
                     if current_price is None:
                         continue
                     current_time = time.time()
                     last_traded = trade.entry_time
-                    avg_price = position.avg_price
-                    remaining_shares = position.shares
+                    avg_price = trade.entry_price
+                    remaining_shares = getattr(trade, "shares", 0.0)
                     cash_profit = (current_price - avg_price) * remaining_shares
-                    pct_profit = (current_price - avg_price) / avg_price
+                    pct_profit = (current_price - avg_price) / avg_price if avg_price else 0.0
                     if current_time - last_traded > HOLDING_TIME_LIMIT:
                         place_sell_order(state, asset_id, "Holding time limit")
                         state.remove_active_trade(asset_id)
@@ -174,12 +188,20 @@ def wait_for_initialization(state: ThreadSafeState) -> bool:
     retry_count = 0
     while retry_count < max_retries and not state.is_shutdown():
         try:
-            positions = fetch_positions_with_retry()
-            for event_id, sides in positions.items():
-                if len(sides) % 2 == 0 and len(sides) > 1:
-                    ids = [s.asset for s in sides]
-                    state.add_asset_pair(ids[0], ids[1])
-            if state.is_initialized():
+            slugs = load_watchlist_slugs("watchlist_slugs.json")
+            pairs, meta = resolve_tokens_from_watchlist(slugs)
+            for a, b in pairs.items():
+                state.add_asset_pair(a, b)
+            tokens = list(meta.keys())
+            state.set_watchlist(tokens, meta)
+            logger.info(f"🔎 Watchlist Summary | slugs={len(slugs)} | tokens={len(tokens)} | pairs={len(pairs)//2}")
+            if tokens:
+                preview = []
+                for t in tokens[:20]:
+                    es, out = state.get_token_meta(t)
+                    preview.append(f"  - token={t} | outcome={out or ''} | slug={es or ''}")
+                logger.info("\n" + "\n".join(preview))
+            if state.is_initialized() and tokens:
                 return True
             retry_count += 1
             time.sleep(2)

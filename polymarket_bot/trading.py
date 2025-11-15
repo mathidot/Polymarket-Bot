@@ -2,7 +2,7 @@ import time
 from typing import Optional, Dict, Any
 from py_clob_client.clob_types import MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
-from .client import client, web3
+from .client import get_client, web3
 from .logger import logger
 from .exceptions import TradingError
 from .types import TradeInfo
@@ -48,6 +48,10 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 current_price = get_current_price(state, asset)
                 if current_price is None:
                     raise TradingError(f"Failed to get current price for {asset}")
+                cli = get_client()
+                if cli is None:
+                    logger.error("❌ ClobClient unavailable, skipping BUY")
+                    return False
                 min_ask_data = get_min_ask_data(asset)
                 if min_ask_data is None:
                     return False
@@ -58,14 +62,16 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 if min_ask_price - current_price > SLIPPAGE_TOLERANCE:
                     return False
                 amount_in_dollars = min(TRADE_UNIT, min_ask_size * min_ask_price)
+                logger.info(f"📝 Buy Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | Ask: ${min_ask_price:.4f} | Liquidity: ${min_ask_size * min_ask_price:.2f} | Slippage: {(min_ask_price - current_price):.4f} | Amount: {amount_in_dollars:.4f}")
                 if not check_usdc_allowance(amount_in_dollars):
                     raise TradingError(f"Failed to ensure USDC allowance for {asset}")
                 order_args = MarketOrderArgs(token_id=str(asset), amount=float(amount_in_dollars), side=BUY)
-                signed_order = client.create_market_order(order_args)
-                response = client.post_order(signed_order, OrderType.FOK)
+                signed_order = cli.create_market_order(order_args)
+                response = cli.post_order(signed_order, OrderType.FOK)
                 if response.get("success"):
                     filled = response.get("data", {}).get("filledAmount", amount_in_dollars)
-                    trade_info = TradeInfo(entry_price=min_ask_price, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True)
+                    logger.info(f"🛒 BUY filled: {filled:.4f} shares of {asset} at ${min_ask_price:.4f} | Reason: {reason}")
+                    trade_info = TradeInfo(entry_price=min_ask_price, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True, shares=float(filled))
                     state.update_recent_trade(asset, TradeType.BUY)
                     state.add_active_trade(asset, trade_info)
                     state.set_last_trade_time(time.time())
@@ -97,26 +103,31 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 current_price = get_current_price(state, asset)
                 if current_price is None:
                     raise TradingError(f"Failed to get current price for {asset}")
+                cli = get_client()
+                if cli is None:
+                    logger.error("❌ ClobClient unavailable, skipping SELL")
+                    return False
                 max_bid_data = get_max_bid_data(asset)
                 if max_bid_data is None:
                     return False
                 max_bid_price = float(max_bid_data["max_bid_price"])
                 max_bid_size = float(max_bid_data["max_bid_size"])
-                positions = state.get_positions()
-                for event_id, item in positions.items():
-                    for position in item:
-                        if position.asset == asset:
-                            balance = position.shares
-                            avg_price = position.avg_price
-                            sell_amount_in_shares = balance
-                sell_amount_in_shares = sell_amount_in_shares
+                active = state.get_active_trades()
+                balance = 0.0
+                avg_price = 0.0
+                if asset in active:
+                    balance = float(getattr(active[asset], "shares", 0.0))
+                    avg_price = float(getattr(active[asset], "entry_price", 0.0))
+                sell_amount_in_shares = balance
                 if sell_amount_in_shares < 1:
                     continue
+                logger.info(f"📝 Sell Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | Bid: ${max_bid_price:.4f} | Amount: {sell_amount_in_shares:.4f}")
                 order_args = MarketOrderArgs(token_id=str(asset), amount=float(sell_amount_in_shares), side=SELL)
-                signed_order = client.create_market_order(order_args)
-                response = client.post_order(signed_order, OrderType.FOK)
+                signed_order = cli.create_market_order(order_args)
+                response = cli.post_order(signed_order, OrderType.FOK)
                 if response.get("success"):
                     filled = response.get("data", {}).get("filledAmount", sell_amount_in_shares)
+                    logger.info(f"🛒 SELL filled: {filled:.4f} shares of {asset} at ${max_bid_price:.4f} | Reason: {reason}")
                     state.update_recent_trade(asset, TradeType.SELL)
                     state.remove_active_trade(asset)
                     state.set_last_trade_time(time.time())

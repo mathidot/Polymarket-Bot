@@ -11,6 +11,7 @@ class TradeInfo:
     entry_time: float
     amount: float
     bot_triggered: bool
+    shares: float
 
 @dataclass
 class PositionInfo:

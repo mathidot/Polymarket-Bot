@@ -35,6 +35,8 @@ class ThreadSafeState:
         self._last_spike_asset: Optional[str] = None
         self._last_spike_price: Optional[float] = None
         self._counter: int = 0
+        self._watchlist_tokens: List[str] = []
+        self._token_meta: Dict[str, Tuple[str, str]] = {}
     def cleanup(self) -> None:
         if not self._cleanup_complete.is_set():
             self.shutdown()
@@ -120,6 +122,19 @@ class ThreadSafeState:
             self._asset_pairs[asset2] = asset1
             self._initialized_assets.add(asset1)
             self._initialized_assets.add(asset2)
+
+    def set_watchlist(self, tokens: List[str], meta: Dict[str, Tuple[str, str]]) -> None:
+        self._watchlist_tokens = tokens
+        self._token_meta = meta
+
+    def get_watchlist_tokens(self) -> List[str]:
+        return list(self._watchlist_tokens)
+
+    def get_token_meta(self, token_id: str) -> Tuple[Optional[str], Optional[str]]:
+        m = self._token_meta.get(token_id)
+        if not m:
+            return None, None
+        return m
     def is_initialized(self) -> bool:
         with self._initialized_assets_lock:
             return len(self._initialized_assets) > 0
