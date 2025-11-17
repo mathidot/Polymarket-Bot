@@ -1,3 +1,4 @@
+"""应用入口：启动、线程管理与优雅退出。"""
 import time
 import signal
 import sys
@@ -11,6 +12,7 @@ from polymarket_bot.client import refresh_api_credentials
 from polymarket_bot.config import REFRESH_INTERVAL
 
 def print_spikebot_banner() -> None:
+    """打印启动横幅。"""
     banner = r"""
 ╔════════════════════════════════════════════════════════════════════╗
 ║                                                                    ║
@@ -28,6 +30,7 @@ def print_spikebot_banner() -> None:
     print(banner)
 
 def cleanup(state: ThreadSafeState) -> None:
+    """优雅清理：发出关闭信号并等待线程结束。"""
     state.shutdown()
     for thread in threading.enumerate():
         if thread != threading.current_thread():
@@ -35,10 +38,12 @@ def cleanup(state: ThreadSafeState) -> None:
     logger.info("✅ Cleanup complete")
 
 def signal_handler(signum: int, frame: any, state: ThreadSafeState) -> None:
+    """处理系统信号并触发清理退出。"""
     cleanup(state)
     sys.exit(0)
 
 def main() -> None:
+    """主函数：初始化状态与线程，启动采集/检测/退出模块与凭证刷新。"""
     state = ThreadSafeState()
     thread_manager = ThreadManager(state)
     print_spikebot_banner()

@@ -6,6 +6,10 @@ from .config import THREAD_POOL_SIZE, MAX_QUEUE_SIZE, MAX_ERRORS, THREAD_RESTART
 from .logger import logger
 
 class ThreadManager:
+    """统一管理与启动后台线程。
+
+    提供线程包装，遇到连续错误时尝试重启；支持优雅停止。
+    """
     def __init__(self, state):
         self.state = state
         self.threads = {}
@@ -13,6 +17,12 @@ class ThreadManager:
         self.executor = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
         self.running = True
     def start_thread(self, name: str, target: callable) -> None:
+        """启动命名线程并包裹错误处理与重启逻辑。
+
+        Args:
+            name: 线程名。
+            target: 线程目标函数，签名为 `func(state)`。
+        """
         if name in self.threads and self.threads[name].is_alive():
             return
         queue = Queue(maxsize=MAX_QUEUE_SIZE)
@@ -41,6 +51,7 @@ class ThreadManager:
         self.threads[name] = thread
         logger.info(f"✅ Started thread: {name}")
     def stop(self) -> None:
+        """优雅停止所有线程并关闭执行器。"""
         self.running = False
         for thread in self.threads.values():
             if thread.is_alive():

@@ -63,7 +63,7 @@ pip install colorlog==6.7.0
 pip install dotenv
 ```
 
-3. Create a `.env` file with your configuration:
+3. Create a `.env` file with your configuration (新增检测与执行配置可选项):
 ```env
 # Wallet Configuration
 PK=your_private_key_here
@@ -91,6 +91,21 @@ cooldown_period=10
 keep_min_shares=1
 max_concurrent_trades=3
 min_liquidity_requirement=10.0
+
+# 请求与会话
+REQUESTS_VERIFY_SSL=true
+
+# 检测窗口与自适应尖刺阈值（可选）
+DETECT_LOOKBACK_SAMPLES=20           # 按样本数回看窗口
+DETECT_LOOKBACK_SECONDS=0            # 按时间窗口，>0 启用秒模式
+DELTA_MODE=samples                   # samples|seconds
+PRICE_SOURCE_DETECT=mid              # 检测价源：mid|ask|bid（预留）
+DYNAMIC_SPIKE_ENABLE=true            # 启用动态尖刺阈值
+SPIKE_VOL_K=1.2                      # 阈值中的波动项系数 k
+SPIKE_SPREAD_BUFFER=0.005            # 阈值中的价差缓冲项
+DEPTH_USD_TARGET=3.0                 # 深度评估目标美元量，默认=trade_unit
+MAX_DEPTH_LEVELS=5                   # 订单簿聚合档位数
+MIN_TRIGGER_INTERVAL_SECONDS=15      # 同资产最小触发间隔（防回转）
 ```
 
 ## 配置参数
@@ -119,6 +134,14 @@ min_liquidity_requirement=10.0
 - `keep_min_shares`: Minimum shares to keep when selling
 - `max_concurrent_trades`: Maximum number of concurrent trades
 - `min_liquidity_requirement`: Minimum liquidity required to trade (USDC)
+- 交易金额上限：每次买入或卖出的美元金额均不超过 `trade_unit`（买入以可成交深度USD与 `trade_unit` 取最小值，卖出按 VWAP 将份额上限限制为 `trade_unit / vwap`）
+
+### 检测与执行改动（新增）
+- 固定回看窗口：尖刺 `delta` 使用最近 N 个样本或最近 T 秒的首尾价变化，替代历史首尾计算。
+- 自适应阈值：实时计算价差 `spread=ask-bid` 与窗口波动率 `σ`，阈值 `threshold = max(spike_threshold, SPIKE_VOL_K*σ, spread+SPIKE_SPREAD_BUFFER)`。
+- 深度与滑点评估：下单前聚合最优前 `MAX_DEPTH_LEVELS` 档，估算 VWAP 与可成交美元深度；若 `DepthUSD < min_liquidity_requirement` 或滑点超出 `slippage_tolerance` 则跳过。
+- 日志增强：检测打印 `delta/threshold/spread/sigma/窗口大小`；执行打印 `VWAP/DepthUSD/Slippage/Amount`。
+- 交易金额上限：每次买入或卖出的美元金额均不超过 `trade_unit`（买入以可成交深度USD与 `trade_unit` 取最小值，卖出按 VWAP 将份额上限限制为 `trade_unit / vwap`）
 - `price_lower_bound`: 尖刺检测后允许交易的价格下界（默认 0.20）
 - `price_upper_bound`: 尖刺检测后允许交易的价格上界（默认 0.80）
 
@@ -128,6 +151,16 @@ min_liquidity_requirement=10.0
 - 启动入口：
 ```bash
 python app.py
+```
+启动后会输出 Watchlist 汇总日志：`slugs/tokens/pairs` 统计与前 20 条 `token → outcome/slug` 映射，便于确认加载情况。
+
+监控清单文件（仅 Watchlist 模式）：在项目根目录创建 `watchlist_slugs.json`：
+```json
+{
+  "slugs": [
+    "fed-decision-in-december"
+  ]
+}
 ```
 
 ## Logging
@@ -169,6 +202,7 @@ This bot is for educational purposes only. Trading cryptocurrencies and predicti
 ![Bot Architecture Diagram](diagram.png)
 
 `polymarket_bot/config.py`、`logger.py`、`exceptions.py`、`types.py`、`state.py`、`client.py`、`api.py`、`orderbook.py`、`pricing.py`、`trading.py`、`detection.py`、`threads.py` 与 `app.py`
+- 监控清单：`watchlist_slugs.json`（按 slug 解析 Market/Token 进行监控，不依赖钱包持仓）
 
 ## 测试
 

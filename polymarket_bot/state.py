@@ -11,6 +11,11 @@ from .logger import logger
 price_update_event = Event()
 
 class ThreadSafeState:
+    """线程安全的全局状态容器。
+
+    维护价格历史、活跃交易、资产配对与最近交易时间等信息；
+    所有读写通过内部锁保护，适用于多线程环境。
+    """
     def __init__(self, max_price_history_size: int = PRICE_HISTORY_SIZE, keep_min_shares: int = KEEP_MIN_SHARES):
         self._price_history_lock = Lock()
         self._active_trades_lock = Lock()
@@ -38,6 +43,7 @@ class ThreadSafeState:
         self._watchlist_tokens: List[str] = []
         self._token_meta: Dict[str, Tuple[str, str]] = {}
     def cleanup(self) -> None:
+        """清理内部状态并标记清理完成。"""
         if not self._cleanup_complete.is_set():
             self.shutdown()
             with self._price_history_lock:
@@ -71,6 +77,7 @@ class ThreadSafeState:
         with self._price_history_lock:
             return self._price_history.get(asset_id, deque())
     def add_price(self, asset_id: str, timestamp: float, price: float, eventslug: str, outcome: str) -> None:
+        """向价格历史写入一条记录。"""
         with self._price_history_lock:
             if not isinstance(asset_id, str):
                 raise ValidationError(f"Invalid asset_id type: {type(asset_id)}")
@@ -78,18 +85,22 @@ class ThreadSafeState:
                 self._price_history[asset_id] = deque(maxlen=self._max_price_history_size)
             self._price_history[asset_id].append((timestamp, price, eventslug, outcome))
     def get_active_trades(self) -> Dict[str, TradeInfo]:
+        """返回活跃交易的快照副本。"""
         with self._active_trades_lock:
             return dict(self._active_trades)
     def add_active_trade(self, asset_id: str, trade_info: TradeInfo) -> None:
+        """新增或更新指定资产的活跃交易。"""
         with self._active_trades_lock:
             self._active_trades[asset_id] = trade_info
     def remove_active_trade(self, asset_id: str) -> None:
+        """移除指定资产的活跃交易。"""
         with self._active_trades_lock:
             self._active_trades.pop(asset_id, None)
     def get_positions(self) -> Dict[str, List[PositionInfo]]:
         with self._positions_lock:
             return dict(self._positions)
     def update_positions(self, new_positions: Dict[str, List[PositionInfo]]) -> None:
+        """更新钱包持仓（在 Watchlist 模式下可忽略）。"""
         if new_positions is None:
             return
         if not isinstance(new_positions, dict):
@@ -117,6 +128,7 @@ class ThreadSafeState:
         with self._asset_pairs_lock:
             return self._asset_pairs.get(asset_id)
     def add_asset_pair(self, asset1: str, asset2: str) -> None:
+        """登记资产配对（互指）。"""
         with self._asset_pairs_lock:
             self._asset_pairs[asset1] = asset2
             self._asset_pairs[asset2] = asset1
@@ -124,13 +136,16 @@ class ThreadSafeState:
             self._initialized_assets.add(asset2)
 
     def set_watchlist(self, tokens: List[str], meta: Dict[str, Tuple[str, str]]) -> None:
+        """设置监控 token 列表及其元数据（slug/outcome）。"""
         self._watchlist_tokens = tokens
         self._token_meta = meta
 
     def get_watchlist_tokens(self) -> List[str]:
+        """获取监控的 token ID 列表。"""
         return list(self._watchlist_tokens)
 
     def get_token_meta(self, token_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """返回 token 的 (slug, outcome) 元信息。"""
         m = self._token_meta.get(token_id)
         if not m:
             return None, None

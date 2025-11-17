@@ -12,10 +12,25 @@ from .config import MAX_RETRIES, BASE_DELAY, MAX_CONCURRENT_TRADES, MIN_LIQUIDIT
 from .orderbook import get_min_ask_data, get_max_bid_data
 from .state import ThreadSafeState
 from .pricing import get_current_price
+from .orderbook import estimate_vwap_for_amount
 
 def check_usdc_allowance(required_amount: float) -> bool:
+    """检查 USDC 余额/额度是否满足下单金额。
+
+    Args:
+        required_amount: 需要的美元金额。
+
+    Returns:
+        True 表示额度充足；False 表示客户端不可用或额度不足。
+
+    Raises:
+        TradingError: 客户端调用异常。
+    """
     try:
-        collateral = client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        cli = get_client()
+        if cli is None:
+            return False
+        collateral = cli.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
         current_balance = collateral.get('balance', 0)
         try:
             current_balance = float(current_balance)
@@ -32,6 +47,18 @@ def check_usdc_allowance(required_amount: float) -> bool:
     return False
 
 def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
+    """执行买入订单（FOK）。
+
+    先评估 VWAP 与深度及滑点，金额不超过 `trade_unit`；成功则记录活跃交易。
+
+    Args:
+        state: 线程安全状态对象。
+        asset: 资产 token ID。
+        reason: 买入理由，用于日志。
+
+    Returns:
+        True 表示下单成功；False 表示跳过或失败。
+    """
     try:
         active_trades = state.get_active_trades()
         if len(active_trades) >= MAX_CONCURRENT_TRADES:
@@ -52,17 +79,17 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 if cli is None:
                     logger.error("❌ ClobClient unavailable, skipping BUY")
                     return False
-                min_ask_data = get_min_ask_data(asset)
-                if min_ask_data is None:
+                est = estimate_vwap_for_amount(asset, "BUY", TRADE_UNIT, max_levels=5)
+                if est is None:
                     return False
-                min_ask_price = float(min_ask_data["min_ask_price"])
-                min_ask_size = float(min_ask_data["min_ask_size"])
-                if min_ask_size * min_ask_price < MIN_LIQUIDITY_REQUIREMENT:
+                vwap = float(est.get("vwap", 0.0))
+                available_usd = float(est.get("available_usd", 0.0))
+                if available_usd < MIN_LIQUIDITY_REQUIREMENT:
                     return False
-                if min_ask_price - current_price > SLIPPAGE_TOLERANCE:
+                if (vwap - current_price) > SLIPPAGE_TOLERANCE:
                     return False
-                amount_in_dollars = min(TRADE_UNIT, min_ask_size * min_ask_price)
-                logger.info(f"📝 Buy Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | Ask: ${min_ask_price:.4f} | Liquidity: ${min_ask_size * min_ask_price:.2f} | Slippage: {(min_ask_price - current_price):.4f} | Amount: {amount_in_dollars:.4f}")
+                amount_in_dollars = min(TRADE_UNIT, available_usd)
+                logger.info(f"📝 Buy Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | VWAP: ${vwap:.4f} | DepthUSD: ${available_usd:.2f} | Slippage: {(vwap - current_price):.4f} | Amount: {amount_in_dollars:.4f}")
                 if not check_usdc_allowance(amount_in_dollars):
                     raise TradingError(f"Failed to ensure USDC allowance for {asset}")
                 order_args = MarketOrderArgs(token_id=str(asset), amount=float(amount_in_dollars), side=BUY)
@@ -70,8 +97,8 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 response = cli.post_order(signed_order, OrderType.FOK)
                 if response.get("success"):
                     filled = response.get("data", {}).get("filledAmount", amount_in_dollars)
-                    logger.info(f"🛒 BUY filled: {filled:.4f} shares of {asset} at ${min_ask_price:.4f} | Reason: {reason}")
-                    trade_info = TradeInfo(entry_price=min_ask_price, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True, shares=float(filled))
+                    logger.info(f"🛒 BUY filled: {filled:.4f} shares of {asset} at ${vwap:.4f} | Reason: {reason}")
+                    trade_info = TradeInfo(entry_price=vwap, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True, shares=float(filled))
                     state.update_recent_trade(asset, TradeType.BUY)
                     state.add_active_trade(asset, trade_info)
                     state.set_last_trade_time(time.time())
@@ -95,6 +122,19 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
         raise
 
 def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
+    """执行卖出订单（FOK）。
+
+    以活跃交易中的 shares 为基础，按 VWAP 将卖出份额上限限制为 `trade_unit/vwap`；
+    滑点超限或深度不足则跳过。
+
+    Args:
+        state: 线程安全状态对象。
+        asset: 资产 token ID。
+        reason: 卖出理由，用于日志。
+
+    Returns:
+        True 表示下单成功；False 表示跳过或失败。
+    """
     try:
         max_retries = MAX_RETRIES
         base_delay = BASE_DELAY
@@ -107,11 +147,11 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 if cli is None:
                     logger.error("❌ ClobClient unavailable, skipping SELL")
                     return False
-                max_bid_data = get_max_bid_data(asset)
-                if max_bid_data is None:
+                est = estimate_vwap_for_amount(asset, "SELL", TRADE_UNIT, max_levels=5)
+                if est is None:
                     return False
-                max_bid_price = float(max_bid_data["max_bid_price"])
-                max_bid_size = float(max_bid_data["max_bid_size"])
+                vwap = float(est.get("vwap", 0.0))
+                available_usd = float(est.get("available_usd", 0.0))
                 active = state.get_active_trades()
                 balance = 0.0
                 avg_price = 0.0
@@ -121,13 +161,18 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 sell_amount_in_shares = balance
                 if sell_amount_in_shares < 1:
                     continue
-                logger.info(f"📝 Sell Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | Bid: ${max_bid_price:.4f} | Amount: {sell_amount_in_shares:.4f}")
+                # cap sell amount by TRADE_UNIT (USD) using vwap
+                max_sell_shares = min(sell_amount_in_shares, TRADE_UNIT / vwap if vwap > 0 else sell_amount_in_shares)
+                sell_amount_in_shares = max_sell_shares
+                if (current_price - vwap) > SLIPPAGE_TOLERANCE:
+                    return False
+                logger.info(f"📝 Sell Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | VWAP: ${vwap:.4f} | Amount: {sell_amount_in_shares:.4f}")
                 order_args = MarketOrderArgs(token_id=str(asset), amount=float(sell_amount_in_shares), side=SELL)
                 signed_order = cli.create_market_order(order_args)
                 response = cli.post_order(signed_order, OrderType.FOK)
                 if response.get("success"):
                     filled = response.get("data", {}).get("filledAmount", sell_amount_in_shares)
-                    logger.info(f"🛒 SELL filled: {filled:.4f} shares of {asset} at ${max_bid_price:.4f} | Reason: {reason}")
+                    logger.info(f"🛒 SELL filled: {filled:.4f} shares of {asset} at ${vwap:.4f} | Reason: {reason}")
                     state.update_recent_trade(asset, TradeType.SELL)
                     state.remove_active_trade(asset)
                     state.set_last_trade_time(time.time())

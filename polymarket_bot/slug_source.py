@@ -1,49 +1,42 @@
 import json
 import time
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from typing import Dict, List, Tuple, Optional
 from .logger import logger
-from .config import API_TIMEOUT, MAX_RETRIES, REQUESTS_VERIFY_SSL
 
 EVENTS_URL = "https://gamma-api.polymarket.com/events"
 SLUG_URL = "https://gamma-api.polymarket.com/events/slug"
 MARKET_URL = "https://gamma-api.polymarket.com/markets"
 
-_session = requests.Session()
-_session.headers.update({
-    "Accept": "application/json",
-    "User-Agent": "PolymarketSpikeBot/1.0 (+https://polymarket.com)"
-})
-_retry = Retry(
-    total=MAX_RETRIES,
-    connect=MAX_RETRIES,
-    read=MAX_RETRIES,
-    backoff_factor=0.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET"],
-    raise_on_status=False,
-)
-_adapter = HTTPAdapter(max_retries=_retry)
-_session.mount("https://", _adapter)
-_session.mount("http://", _adapter)
+def _fetch_json(url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None, timeout: int = 10) -> Dict:
+    """获取并解析 JSON 响应，带请求头与超时。
 
-def _fetch_json(url: str, params: Optional[Dict] = None) -> Dict:
-    params = params or {}
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = _session.get(url, params=params, timeout=API_TIMEOUT, verify=REQUESTS_VERIFY_SSL)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.SSLError as e:
-            logger.error(f"请求失败: {e} | 尝试 {attempt}/{MAX_RETRIES} | URL={url}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"请求失败: {e} | 尝试 {attempt}/{MAX_RETRIES} | URL={url}")
-        time.sleep(min(5, 0.5 * (2 ** (attempt - 1))))
-    raise requests.exceptions.RequestException(f"请求失败: 达到最大重试次数 ({MAX_RETRIES}) | URL={url}")
+    Args:
+        url: 请求地址。
+        params: 查询参数。
+        headers: 额外请求头。
+        timeout: 请求超时秒数。
+
+    Returns:
+        解析后的 JSON 对象（dict 或 list）。
+
+    Raises:
+        requests.exceptions.RequestException: 非 200 或网络异常。
+    """
+    h = {
+        "Accept": "application/json",
+        "User-Agent": "polymarket-bot/slug-source"
+    }
+    if headers:
+        h.update(headers)
+    resp = requests.get(url, params=params, headers=h, timeout=timeout)
+    if resp.status_code != 200:
+        logger.error(f"HTTP {resp.status_code} for {url} | {resp.text[:200]}")
+        resp.raise_for_status()
+    return resp.json()
 
 def get_all_slug_events() -> List[str]:
+    """分页拉取未关闭事件的全部 slugs。"""
     all_slug_events: List[str] = []
     next_cursor = ""
     page_count = 0
@@ -70,6 +63,7 @@ def get_all_slug_events() -> List[str]:
     return all_slug_events
 
 def get_market_from_slug(eventslug: str) -> List[str]:
+    """按事件 slug 获取关联的 market ID 列表。"""
     url = f"{SLUG_URL}/{eventslug}"
     market_ids: List[str] = []
     try:
@@ -86,6 +80,7 @@ def get_market_from_slug(eventslug: str) -> List[str]:
         raise e
 
 def get_token_from_market(market_id: str) -> List[str]:
+    """按 market ID 获取二元市场的 clobTokenIds（YES/NO）。"""
     url = f"{MARKET_URL}/{market_id}"
     try:
         market_data = _fetch_json(url)
@@ -104,12 +99,18 @@ def get_token_from_market(market_id: str) -> List[str]:
         raise e
 
 def load_watchlist_slugs(path: str) -> List[str]:
+    """从 JSON 文件加载监控的 slugs 列表。"""
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     slugs = data.get("slugs", [])
     return [s for s in slugs if s]
 
 def resolve_tokens_from_watchlist(slugs: List[str]) -> Tuple[Dict[str, str], Dict[str, Tuple[str, str]]]:
+    """解析 watchlist slugs 为 token 配对与元数据。
+
+    Returns:
+        (pairs, meta)，其中 pairs 为互指配对映射，meta 为 token → (slug, outcome)。
+    """
     pairs: Dict[str, str] = {}
     meta: Dict[str, Tuple[str, str]] = {}
     for slug in slugs:
@@ -126,3 +127,4 @@ def resolve_tokens_from_watchlist(slugs: List[str]) -> Tuple[Dict[str, str], Dic
             except Exception:
                 continue
     return pairs, meta
+"""基于 slug 解析 Polymarket 市场与 token 的数据源模块。"""

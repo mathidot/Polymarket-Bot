@@ -78,3 +78,15 @@ MAX_QUEUE_SIZE = 1000
 THREAD_CHECK_INTERVAL = 5
 THREAD_RESTART_DELAY = 2
 REQUESTS_VERIFY_SSL = os.getenv("REQUESTS_VERIFY_SSL", "true").lower() == "true"
+
+# Detection window & dynamic spike threshold
+DETECT_LOOKBACK_SAMPLES = int(os.getenv("DETECT_LOOKBACK_SAMPLES", "20"))
+DETECT_LOOKBACK_SECONDS = float(os.getenv("DETECT_LOOKBACK_SECONDS", "0"))
+DELTA_MODE = os.getenv("DELTA_MODE", "samples")
+PRICE_SOURCE_DETECT = os.getenv("PRICE_SOURCE_DETECT", "mid")
+DYNAMIC_SPIKE_ENABLE = os.getenv("DYNAMIC_SPIKE_ENABLE", "true").lower() == "true"
+SPIKE_VOL_K = float(os.getenv("SPIKE_VOL_K", "1.2"))
+SPIKE_SPREAD_BUFFER = float(os.getenv("SPIKE_SPREAD_BUFFER", "0.005"))
+DEPTH_USD_TARGET = float(os.getenv("DEPTH_USD_TARGET", os.getenv("trade_unit", "3.0")))
+MAX_DEPTH_LEVELS = int(os.getenv("MAX_DEPTH_LEVELS", "5"))
+MIN_TRIGGER_INTERVAL_SECONDS = float(os.getenv("MIN_TRIGGER_INTERVAL_SECONDS", "15"))
