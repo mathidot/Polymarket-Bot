@@ -48,9 +48,6 @@ def check_usdc_allowance(required_amount: float) -> bool:
 
 def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
     """执行买入订单（FOK）。
-
-    先评估 VWAP 与深度及滑点，金额不超过 `trade_unit`；成功则记录活跃交易。
-
     Args:
         state: 线程安全状态对象。
         asset: 资产 token ID。
@@ -79,17 +76,19 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 if cli is None:
                     logger.error("❌ ClobClient unavailable, skipping BUY")
                     return False
-                est = estimate_vwap_for_amount(asset, "BUY", TRADE_UNIT, max_levels=5)
-                if est is None:
+                # 简化逻辑：买入最优卖价，数量受卖家可卖量与 trade_unit 限制
+                ask_data = get_min_ask_data(asset)
+                if ask_data is None:
                     return False
-                vwap = float(est.get("vwap", 0.0))
-                available_usd = float(est.get("available_usd", 0.0))
-                if available_usd < MIN_LIQUIDITY_REQUIREMENT:
+                min_ask_price = float(ask_data["min_ask_price"])
+                min_ask_size = float(ask_data["min_ask_size"])
+                # 按 trade_unit 限制美元金额；以卖家可卖量限制份额
+                max_shares_by_unit = TRADE_UNIT / min_ask_price if min_ask_price > 0 else 0.0
+                shares_to_buy = min(min_ask_size, max_shares_by_unit)
+                if shares_to_buy <= 0:
                     return False
-                if (vwap - current_price) > SLIPPAGE_TOLERANCE:
-                    return False
-                amount_in_dollars = min(TRADE_UNIT, available_usd)
-                logger.info(f"📝 Buy Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | VWAP: ${vwap:.4f} | DepthUSD: ${available_usd:.2f} | Slippage: {(vwap - current_price):.4f} | Amount: {amount_in_dollars:.4f}")
+                amount_in_dollars = shares_to_buy * min_ask_price
+                logger.info(f"📝 Buy Reason: {reason} | Asset: {asset} | BestAsk: ${min_ask_price:.4f} | AskSize: {min_ask_size:.4f} | SharesToBuy: {shares_to_buy:.4f} | AmountUSD: {amount_in_dollars:.4f}")
                 if not check_usdc_allowance(amount_in_dollars):
                     raise TradingError(f"Failed to ensure USDC allowance for {asset}")
                 order_args = MarketOrderArgs(token_id=str(asset), amount=float(amount_in_dollars), side=BUY)
@@ -97,8 +96,8 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 response = cli.post_order(signed_order, OrderType.FOK)
                 if response.get("success"):
                     filled = response.get("data", {}).get("filledAmount", amount_in_dollars)
-                    logger.info(f"🛒 BUY filled: {filled:.4f} shares of {asset} at ${vwap:.4f} | Reason: {reason}")
-                    trade_info = TradeInfo(entry_price=vwap, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True, shares=float(filled))
+                    logger.info(f"🛒 BUY filled: {filled:.4f} shares of {asset} at ${min_ask_price:.4f} | Reason: {reason}")
+                    trade_info = TradeInfo(entry_price=min_ask_price, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True, shares=float(filled))
                     state.update_recent_trade(asset, TradeType.BUY)
                     state.add_active_trade(asset, trade_info)
                     state.set_last_trade_time(time.time())

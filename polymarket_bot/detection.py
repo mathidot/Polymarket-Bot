@@ -1,5 +1,6 @@
 import time
 import statistics
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from .state import ThreadSafeState, price_update_event
 from .logger import logger
@@ -7,6 +8,9 @@ from .config import PRICE_LOWER_BOUND, PRICE_UPPER_BOUND, SPIKE_THRESHOLD
 from .config import CASH_PROFIT, CASH_LOSS, PCT_PROFIT, PCT_LOSS, HOLDING_TIME_LIMIT
 from .config import DYNAMIC_SPIKE_ENABLE, SPIKE_VOL_K, SPIKE_SPREAD_BUFFER
 from .config import DELTA_MODE, DETECT_LOOKBACK_SECONDS, DETECT_LOOKBACK_SAMPLES
+from .config import PRICE_FRESHNESS_SECONDS
+from .config import COOLDOWN_PERIOD
+from .config import FETCH_INTERVAL_MS, FETCH_CONCURRENCY, DETECT_CONCURRENCY, EXIT_CONCURRENCY
 from .trading import place_buy_order, place_sell_order
 from .pricing import get_current_price
 from .client import get_client
@@ -34,41 +38,41 @@ def update_price_history(state: ThreadSafeState) -> None:
             price_updated = False
             current_time = time.time()
             price_updates = []
-            for token in tokens:
-                price = None
-                eventslug, outcome = state.get_token_meta(token)
-                for attempt in range(2):
+
+            def _fetch_and_store(token_id: str):
+                price_local = None
+                es, out = state.get_token_meta(token_id)
+                try:
+                    cli_local = get_client()
+                    if cli_local is None:
+                        raise RuntimeError("ClobClient unavailable")
+                    ob = cli_local.get_order_book(token_id)
+                    if ob.bids and ob.asks:
+                        best_bid = max(ob.bids, key=lambda lvl: float(lvl.price))
+                        best_ask = min(ob.asks, key=lambda lvl: float(lvl.price))
+                        price_local = (float(best_bid.price) + float(best_ask.price)) / 2.0
+                except Exception:
+                    price_local = None
+                if price_local is None:
                     try:
-                        cli = get_client()
-                        if cli is None:
+                        cli_local = get_client()
+                        if cli_local is None:
                             raise RuntimeError("ClobClient unavailable")
-                        order = cli.get_order_book(token)
-                        if order.bids and order.asks:
-                            max_bid_price = float(order.bids[-1].price)
-                            min_ask_price = float(order.asks[-1].price)
-                            price = (max_bid_price + min_ask_price) / 2.0
-                            break
+                        price_local = float(cli_local.get_price(token_id, "BUY"))
                     except Exception:
-                        time.sleep(0.2)
-                        continue
-                if price is None:
-                    for attempt in range(2):
-                        try:
-                            cli = get_client()
-                            if cli is None:
-                                raise RuntimeError("ClobClient unavailable")
-                            price = float(cli.get_price(token, "BUY"))
-                            break
-                        except Exception:
-                            time.sleep(0.2)
-                            continue
-                if price is None:
-                    logger.error(f"❌ Failed to fetch price for token {token}: retries exhausted")
-                    continue
-                state.add_price(token, now, float(price), eventslug or "", outcome or "")
-                update_count += 1
-                price_updated = True
-                price_updates.append(f"                                               💸 {outcome or ''} in {eventslug or ''} | token {token}: ${float(price):.4f}")
+                        price_local = None
+                if price_local is None:
+                    logger.debug(f"Skip token {token_id}: price unavailable this cycle")
+                    return None
+                state.add_price(token_id, now, float(price_local), es or "", out or "")
+                return f"                                               💸 {out or ''} in {es or ''} | token {token_id}: ${float(price_local):.4f}"
+
+            with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
+                for res in ex.map(_fetch_and_store, tokens):
+                    if res:
+                        price_updates.append(res)
+                        update_count += 1
+                        price_updated = True
             if current_time - last_log_time >= 5:
                 if price_updates:
                     logger.info("📊 Price Updates:\n" + "\n".join(price_updates))
@@ -84,13 +88,85 @@ def update_price_history(state: ThreadSafeState) -> None:
                 logger.info(f"📊 Price Update Summary | Updates: {update_count} | Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
                 update_count = 0
             elapsed = time.time() - start_time
-            if elapsed < 1.0:
-                time.sleep(1.0 - elapsed)
+            target_sec = max(0.0, (FETCH_INTERVAL_MS / 1000.0) - elapsed)
+            if target_sec > 0:
+                time.sleep(target_sec)
         except Exception as e:
             logger.error(f"❌ Error in price update: {str(e)}")
             time.sleep(1)
 
+
 def detect_and_trade(state: ThreadSafeState) -> None:
+    """尖刺检测与交易执行。
+
+    只看当前价格和上一个时间点的价格
+    触发后执行主腿与对冲腿交易，并遵守冷却与价格区间限制。
+
+    Args:
+        state: 线程安全状态对象。
+    """
+    last_log_time = time.time()
+    scan_count = 0
+    while not state.is_shutdown():
+        try:
+            if price_update_event.wait(timeout=1.0):
+                price_update_event.clear()
+                if not any(state.get_price_history(asset_id) for asset_id in state._price_history.keys()):
+                    continue
+                scan_count += 1
+                current_time = time.time()
+                if current_time - last_log_time >= 5:
+                    logger.info(f"🔍 Scanning Markets | Scan #{scan_count} | Tracked Assets: {len(state._price_history)}")
+                    last_log_time = current_time
+                assets = list(state._price_history.keys())
+                def _process_asset(asset_id: str):
+                    try:
+                        history = state.get_price_history(asset_id)
+                        if not history or len(history) < 2:
+                            return
+                        last_ts = float(history[-1][0])
+                        if time.time() - last_ts > PRICE_FRESHNESS_SECONDS:
+                            return
+                        old_price = float(history[-2][1])
+                        new_price = float(history[-1][1])
+                        if old_price == 0 or new_price == 0:
+                            logger.warning(f"⚠️ Skipping asset {asset_id} due to zero price - Old: ${old_price:.4f}, New: ${new_price:.4f}")
+                            return
+                        delta = (new_price - old_price) / old_price
+                        if abs(delta) > SPIKE_THRESHOLD:
+                            if new_price < PRICE_LOWER_BOUND or new_price > PRICE_UPPER_BOUND:
+                                return
+                            def is_recently_bought(s: ThreadSafeState, aid: str) -> bool:
+                                with s._recent_trades_lock:
+                                    if aid not in s._recent_trades or s._recent_trades[aid]["buy"] is None:
+                                        return False
+                                    now2 = time.time()
+                                    return (now2 - s._recent_trades[aid]["buy"]) < COOLDOWN_PERIOD
+                            def is_recently_sold(s: ThreadSafeState, aid: str) -> bool:
+                                with s._recent_trades_lock:
+                                    if aid not in s._recent_trades or s._recent_trades[aid]["sell"] is None:
+                                        return False
+                                    now2 = time.time()
+                                    return (now2 - s._recent_trades[aid]["sell"]) < COOLDOWN_PERIOD
+                            opposite = state.get_asset_pair(asset_id)
+                            if not opposite:
+                                return
+                            if delta > 0 and not is_recently_bought(state, asset_id):
+                                if place_buy_order(state, asset_id, "Spike detected"):
+                                    place_sell_order(state, opposite, "Opposite trade")
+                            elif delta < 0 and not is_recently_sold(state, asset_id):
+                                if place_sell_order(state, asset_id, "Spike detected"):
+                                    place_buy_order(state, opposite, "Opposite trade")
+                    except Exception as e:
+                        logger.error(f"❌ Error processing asset {asset_id}: {str(e)}")
+                        return
+                with ThreadPoolExecutor(max_workers=DETECT_CONCURRENCY) as ex:
+                    list(ex.map(_process_asset, assets))
+        except Exception as e:
+            logger.error(f"❌ Error in detect_and_trade: {str(e)}")
+            time.sleep(1)
+
+def detect_and_trade_window(state: ThreadSafeState) -> None:
     """尖刺检测与交易执行。
 
     使用固定回看窗口计算 `delta`，结合动态阈值（spread/σ）判断；
@@ -112,57 +188,58 @@ def detect_and_trade(state: ThreadSafeState) -> None:
                 if current_time - last_log_time >= 5:
                     logger.info(f"🔍 Scanning Markets | Scan #{scan_count} | Tracked Assets: {len(state._price_history)}")
                     last_log_time = current_time
-                for asset_id in list(state._price_history.keys()):
+                assets = list(state._price_history.keys())
+                def _process_asset(aid: str):
                     try:
-                        history = state.get_price_history(asset_id)
+                        history = state.get_price_history(aid)
                         if not history or len(history) < 2:
-                            continue
+                            return
+                        last_ts = float(history[-1][0])
+                        if time.time() - last_ts > PRICE_FRESHNESS_SECONDS:
+                            return
+                        logger.info(f"history: {history}")
                         delta_info = compute_delta_from_history(history)
                         window_delta, first_px, last_px, window_len = delta_info
                         if window_delta is None:
-                            continue
-                        # dynamic threshold
+                            return
                         threshold = SPIKE_THRESHOLD
-                        spread, sigma = compute_spread_sigma(asset_id, history)
+                        spread, sigma = compute_spread_sigma(aid, history)
                         if DYNAMIC_SPIKE_ENABLE:
                             threshold = max(SPIKE_THRESHOLD, SPIKE_VOL_K * sigma, spread + SPIKE_SPREAD_BUFFER)
                         new_price = float(history[-1][1])
+                        logger.info(f"deltaInfo: {delta_info}, window_delta: {window_delta}, spread: {spread}, sigma: {sigma}, threshold: {threshold}")
                         if abs(window_delta) > threshold:
                             if new_price < PRICE_LOWER_BOUND or new_price > PRICE_UPPER_BOUND:
-                                continue
-                            def is_recently_bought(state: ThreadSafeState, asset_id: str) -> bool:
-                                with state._recent_trades_lock:
-                                    if asset_id not in state._recent_trades or state._recent_trades[asset_id]["buy"] is None:
+                                return
+                            def is_recently_bought(s: ThreadSafeState, tid: str) -> bool:
+                                with s._recent_trades_lock:
+                                    if tid not in s._recent_trades or s._recent_trades[tid]["buy"] is None:
                                         return False
-                                    now = time.time()
-                                    from .config import COOLDOWN_PERIOD
-                                    time_since_buy = now - state._recent_trades[asset_id]["buy"]
-                                    return time_since_buy < COOLDOWN_PERIOD
-                            def is_recently_sold(state: ThreadSafeState, asset_id: str) -> bool:
-                                with state._recent_trades_lock:
-                                    if asset_id not in state._recent_trades or state._recent_trades[asset_id]["sell"] is None:
+                                    now2 = time.time()
+                                    return (now2 - s._recent_trades[tid]["buy"]) < COOLDOWN_PERIOD
+                            def is_recently_sold(s: ThreadSafeState, tid: str) -> bool:
+                                with s._recent_trades_lock:
+                                    if tid not in s._recent_trades or s._recent_trades[tid]["sell"] is None:
                                         return False
-                                    now = time.time()
-                                    from .config import COOLDOWN_PERIOD
-                                    time_since_sell = now - state._recent_trades[asset_id]["sell"]
-                                    return time_since_sell < COOLDOWN_PERIOD
-                            opposite = state.get_asset_pair(asset_id)
+                                    now2 = time.time()
+                                    return (now2 - s._recent_trades[tid]["sell"]) < COOLDOWN_PERIOD
+                            opposite = state.get_asset_pair(aid)
                             if not opposite:
-                                continue
-                            if window_delta > 0 and not is_recently_bought(state, asset_id):
-                                if place_buy_order(state, asset_id, f"Spike detected | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}"):
+                                return
+                            if window_delta > 0 and not is_recently_bought(state, aid):
+                                if place_buy_order(state, aid, f"Spike detected | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}"):
                                     place_sell_order(state, opposite, "Opposite trade")
-                            elif window_delta < 0 and not is_recently_sold(state, asset_id):
-                                if place_sell_order(state, asset_id, f"Spike detected | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}"):
+                            elif window_delta < 0 and not is_recently_sold(state, aid):
+                                if place_sell_order(state, aid, f"Spike detected | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}"):
                                     place_buy_order(state, opposite, "Opposite trade")
                     except Exception as e:
-                        logger.error(f"❌ Error processing asset {asset_id}: {str(e)}")
-                        continue
+                        logger.error(f"❌ Error processing asset {aid}: {str(e)}")
+                        return
+                with ThreadPoolExecutor(max_workers=DETECT_CONCURRENCY) as ex:
+                    list(ex.map(_process_asset, assets))
         except Exception as e:
             logger.error(f"❌ Error in detect_and_trade: {str(e)}")
             time.sleep(1)
-
- 
 
 def check_trade_exits(state: ThreadSafeState) -> None:
     """周期检查活跃交易的止盈/止损与超时退出。
@@ -179,32 +256,40 @@ def check_trade_exits(state: ThreadSafeState) -> None:
                 if current_time - last_log_time >= 30:
                     logger.info(f"📈 Active Trades | Count: {len(active_trades)} | Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
                     last_log_time = current_time
-            for asset_id, trade in active_trades.items():
+            items = list(active_trades.items())
+            def _process_exit(item):
+                asset_id, trade = item
                 try:
                     current_price = get_current_price(state, asset_id)
                     if current_price is None:
-                        continue
-                    current_time = time.time()
+                        return
+                    now3 = time.time()
                     last_traded = trade.entry_time
                     avg_price = trade.entry_price
                     remaining_shares = getattr(trade, "shares", 0.0)
                     cash_profit = (current_price - avg_price) * remaining_shares
                     pct_profit = (current_price - avg_price) / avg_price if avg_price else 0.0
-                    if current_time - last_traded > HOLDING_TIME_LIMIT:
+                    if now3 - last_traded > HOLDING_TIME_LIMIT:
                         place_sell_order(state, asset_id, "Holding time limit")
                         state.remove_active_trade(asset_id)
                         state.set_last_trade_time(time.time())
+                        return
                     if cash_profit >= CASH_PROFIT or pct_profit > PCT_PROFIT:
                         place_sell_order(state, asset_id, "Take profit")
                         state.remove_active_trade(asset_id)
                         state.set_last_trade_time(time.time())
+                        return
                     if cash_profit <= CASH_LOSS or pct_profit < PCT_LOSS:
                         place_sell_order(state, asset_id, "Stop loss")
                         state.remove_active_trade(asset_id)
                         state.set_last_trade_time(time.time())
+                        return
                 except Exception as e:
                     logger.error(f"❌ Error checking trade exit for {asset_id}: {str(e)}")
-                    continue
+                    return
+            if items:
+                with ThreadPoolExecutor(max_workers=EXIT_CONCURRENCY) as ex:
+                    list(ex.map(_process_exit, items))
             time.sleep(1)
         except Exception as e:
             logger.error(f"❌ Error in check_trade_exits: {str(e)}")
