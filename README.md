@@ -108,6 +108,20 @@ MAX_DEPTH_LEVELS=5                   # 订单簿聚合档位数
 MIN_TRIGGER_INTERVAL_SECONDS=15      # 同资产最小触发间隔（防回转）
 ```
 
+4. 并发与频率（可选）
+```env
+# 采价并发与周期
+FETCH_INTERVAL_MS=200                  # 每轮采价的最小周期，毫秒
+FETCH_CONCURRENCY=4                    # 采价并发线程数
+
+# 检测/退出并发
+DETECT_CONCURRENCY=4                   # 检测并发线程数（按资产）
+EXIT_CONCURRENCY=4                     # 退出并发线程数（按交易）
+
+# 价格新鲜度
+PRICE_FRESHNESS_SECONDS=2.5            # 超过该秒数未更新则跳过该资产
+```
+
 ## 配置参数
 
 ### Wallet Settings
@@ -137,11 +151,13 @@ MIN_TRIGGER_INTERVAL_SECONDS=15      # 同资产最小触发间隔（防回转�
 - 交易金额上限：每次买入或卖出的美元金额均不超过 `trade_unit`（买入以可成交深度USD与 `trade_unit` 取最小值，卖出按 VWAP 将份额上限限制为 `trade_unit / vwap`）
 
 ### 检测与执行改动（新增）
-- 固定回看窗口：尖刺 `delta` 使用最近 N 个样本或最近 T 秒的首尾价变化，替代历史首尾计算。
+- 两点检测（默认）：主检测函数仅比较“上一个价格 vs 当前价格”的相对变化 `delta = (p1-p0)/p0`。
+- 窗口检测（可选）：备用函数支持按最近 N 个样本或 T 秒计算窗口 `delta` 并结合动态阈值；仅在需要时启用。
 - 自适应阈值：实时计算价差 `spread=ask-bid` 与窗口波动率 `σ`，阈值 `threshold = max(spike_threshold, SPIKE_VOL_K*σ, spread+SPIKE_SPREAD_BUFFER)`。
-- 深度与滑点评估：下单前聚合最优前 `MAX_DEPTH_LEVELS` 档，估算 VWAP 与可成交美元深度；若 `DepthUSD < min_liquidity_requirement` 或滑点超出 `slippage_tolerance` 则跳过。
-- 日志增强：检测打印 `delta/threshold/spread/sigma/窗口大小`；执行打印 `VWAP/DepthUSD/Slippage/Amount`。
-- 交易金额上限：每次买入或卖出的美元金额均不超过 `trade_unit`（买入以可成交深度USD与 `trade_unit` 取最小值，卖出按 VWAP 将份额上限限制为 `trade_unit / vwap`）
+- 并发检测：按资产并行处理，受 `DETECT_CONCURRENCY` 控制；退出检查按交易并行，受 `EXIT_CONCURRENCY` 控制。
+- 采价并发与周期：按 `FETCH_CONCURRENCY` 并行抓取价格；以 `FETCH_INTERVAL_MS` 控制最小轮询周期；拿不到价格不重试，当前轮直接跳过。
+- 买入逻辑简化：买入使用最优卖价与卖家可卖量，美元金额不超过 `trade_unit`；卖出侧按 VWAP 将份额上限限制为 `trade_unit / vwap`。
+- 日志增强：检测打印 `delta/threshold/spread/sigma/窗口大小`；执行打印买卖理由与成交详情。
 - `price_lower_bound`: 尖刺检测后允许交易的价格下界（默认 0.20）
 - `price_upper_bound`: 尖刺检测后允许交易的价格上界（默认 0.80）
 
@@ -186,8 +202,10 @@ The bot maintains detailed logs in the `logs` directory:
 - The bot maintains minimum shares when selling
 - Trades are executed with configurable unit size
 - API credentials are refreshed hourly
-- Price updates occur every second
-- Position checks occur every second
+- 价格采集周期由 `FETCH_INTERVAL_MS` 控制（默认 200ms），并以 `FETCH_CONCURRENCY` 并发拉取
+- 检测与退出评估按事件驱动与每秒轮询混合执行，受并发参数控制
+- Watchlist 使用 Gamma API 解析 `slug → markets → tokens`，避免 `www.polymarket.com/api/events/...` 的 404 问题
+- 请求会话使用 `requests.Session + Retry` 并可通过 `REQUESTS_VERIFY_SSL` 控制证书验证
 
 ## Disclaimer
 
