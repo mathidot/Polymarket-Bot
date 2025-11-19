@@ -98,3 +98,6 @@ DETECT_CONCURRENCY = int(os.getenv("DETECT_CONCURRENCY", "4"))
 EXIT_CONCURRENCY = int(os.getenv("EXIT_CONCURRENCY", "4"))
 SIM_MODE = os.getenv("SIM_MODE", "true").lower() == "true"
 SIM_START_USDC = float(os.getenv("SIM_START_USDC", "1000.0"))
+PROB_THRESHOLD_STRATEGY_ENABLE = os.getenv("PROB_THRESHOLD_STRATEGY_ENABLE", "true").lower() == "true"
+PROB_ENTRY_THRESHOLD = float(os.getenv("PROB_ENTRY_THRESHOLD", "0.80"))
+PROB_STOP_THRESHOLD = float(os.getenv("PROB_STOP_THRESHOLD", "0.60"))

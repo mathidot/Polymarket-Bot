@@ -5,6 +5,7 @@ from typing import Optional
 from .state import ThreadSafeState, price_update_event
 from .logger import logger
 from .config import PRICE_LOWER_BOUND, PRICE_UPPER_BOUND, SPIKE_THRESHOLD
+from .config import PROB_THRESHOLD_STRATEGY_ENABLE, PROB_ENTRY_THRESHOLD, PROB_STOP_THRESHOLD
 from .config import CASH_PROFIT, CASH_LOSS, PCT_PROFIT, PCT_LOSS, HOLDING_TIME_LIMIT
 from .config import DYNAMIC_SPIKE_ENABLE, SPIKE_VOL_K, SPIKE_SPREAD_BUFFER
 from .config import DELTA_MODE, DETECT_LOOKBACK_SECONDS, DETECT_LOOKBACK_SAMPLES
@@ -381,3 +382,75 @@ def compute_spread_sigma(asset_id: str, history) -> tuple:
     except Exception:
         sigma = 0.0
     return spread, sigma
+
+def run_prob_threshold_strategy(state: ThreadSafeState) -> None:
+    last_log_time = time.time()
+    scan_count = 0
+    while not state.is_shutdown():
+        try:
+            if price_update_event.wait(timeout=1.0):
+                price_update_event.clear()
+                assets = list(state._price_history.keys())
+                if not assets:
+                    continue
+                scan_count += 1
+                current_time = time.time()
+                if current_time - last_log_time >= 5:
+                    logger.info(f"🔍 ProbStrategy | Scan #{scan_count} | Tracked Assets: {len(assets)}")
+                    last_log_time = current_time
+                def _process_asset(asset_id: str):
+                    try:
+                        history = state.get_price_history(asset_id)
+                        if not history:
+                            return
+                        last_ts = float(history[-1][0])
+                        if time.time() - last_ts > PRICE_FRESHNESS_SECONDS:
+                            return
+                        price_now = float(history[-1][1])
+                        if state.was_bought_once(asset_id):
+                            return
+                        if price_now >= PROB_ENTRY_THRESHOLD:
+                            ok = place_buy_order(state, asset_id, f"Prob-threshold entry @ {price_now:.4f}")
+                            if ok:
+                                state.mark_bought_once(asset_id)
+                    except Exception as e:
+                        logger.error(f"❌ Error in ProbStrategy for {asset_id}: {str(e)}")
+                        return
+                with ThreadPoolExecutor(max_workers=DETECT_CONCURRENCY) as ex:
+                    list(ex.map(_process_asset, assets))
+        except Exception as e:
+            logger.error(f"❌ Error in run_prob_threshold_strategy: {str(e)}")
+            time.sleep(1)
+
+def run_prob_threshold_exits(state: ThreadSafeState) -> None:
+    last_log_time = time.time()
+    while not state.is_shutdown():
+        try:
+            active_trades = state.get_active_trades()
+            if active_trades:
+                current_time = time.time()
+                if current_time - last_log_time >= 30:
+                    logger.info(f"📈 ProbStrategy Exits | Count: {len(active_trades)} | Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    last_log_time = current_time
+            items = list(active_trades.items())
+            def _process_exit(item):
+                asset_id, trade = item
+                try:
+                    current_price = get_current_price(state, asset_id)
+                    if current_price is None:
+                        return
+                    if current_price <= PROB_STOP_THRESHOLD:
+                        place_sell_order(state, asset_id, f"Prob-threshold stop @ {current_price:.4f} <= {PROB_STOP_THRESHOLD:.4f}")
+                        state.remove_active_trade(asset_id)
+                        state.set_last_trade_time(time.time())
+                        return
+                except Exception as e:
+                    logger.error(f"❌ Error in ProbStrategy exit for {asset_id}: {str(e)}")
+                    return
+            if items:
+                with ThreadPoolExecutor(max_workers=EXIT_CONCURRENCY) as ex:
+                    list(ex.map(_process_exit, items))
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"❌ Error in run_prob_threshold_exits: {str(e)}")
+            time.sleep(1)

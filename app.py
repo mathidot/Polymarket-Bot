@@ -7,9 +7,9 @@ from halo import Halo
 from polymarket_bot.logger import logger
 from polymarket_bot.state import ThreadSafeState
 from polymarket_bot.threads import ThreadManager
-from polymarket_bot.detection import wait_for_initialization, update_price_history, detect_and_trade, check_trade_exits
+from polymarket_bot.detection import wait_for_initialization, update_price_history, detect_and_trade, check_trade_exits, run_prob_threshold_strategy, run_prob_threshold_exits
 from polymarket_bot.client import refresh_api_credentials
-from polymarket_bot.config import REFRESH_INTERVAL, SIM_MODE, SIM_START_USDC
+from polymarket_bot.config import REFRESH_INTERVAL, SIM_MODE, SIM_START_USDC, PROB_THRESHOLD_STRATEGY_ENABLE
 
 def print_spikebot_banner() -> None:
     """打印启动横幅。"""
@@ -66,8 +66,12 @@ def main() -> None:
             break
         time.sleep(1)
         initial_data_wait += 1
-    thread_manager.start_thread("detect_trade", detect_and_trade)
-    thread_manager.start_thread("check_exits", check_trade_exits)
+    if PROB_THRESHOLD_STRATEGY_ENABLE:
+        thread_manager.start_thread("prob_strategy", run_prob_threshold_strategy)
+        thread_manager.start_thread("prob_exits", run_prob_threshold_exits)
+    else:
+        thread_manager.start_thread("detect_trade", detect_and_trade)
+        thread_manager.start_thread("check_exits", check_trade_exits)
     last_refresh_time = time.time()
     refresh_interval = REFRESH_INTERVAL
     last_status_time = time.time()

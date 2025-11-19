@@ -45,6 +45,8 @@ class ThreadSafeState:
         self._sim_lock = Lock()
         self._sim_enabled: bool = False
         self._sim_usdc_balance: float = 0.0
+        self._bought_once_lock = Lock()
+        self._bought_once: set = set()
     def cleanup(self) -> None:
         """清理内部状态并标记清理完成。"""
         if not self._cleanup_complete.is_set():
@@ -170,6 +172,14 @@ class ThreadSafeState:
     def get_watchlist_tokens(self) -> List[str]:
         """获取监控的 token ID 列表。"""
         return list(self._watchlist_tokens)
+
+    def was_bought_once(self, asset_id: str) -> bool:
+        with self._bought_once_lock:
+            return asset_id in self._bought_once
+
+    def mark_bought_once(self, asset_id: str) -> None:
+        with self._bought_once_lock:
+            self._bought_once.add(asset_id)
 
     def get_token_meta(self, token_id: str) -> Tuple[Optional[str], Optional[str]]:
         """返回 token 的 (slug, outcome) 元信息。"""
