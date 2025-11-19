@@ -151,21 +151,11 @@ def detect_and_trade(state: ThreadSafeState) -> None:
                                         return False
                                     now2 = time.time()
                                     return (now2 - s._recent_trades[aid]["buy"]) < COOLDOWN_PERIOD
-                            def is_recently_sold(s: ThreadSafeState, aid: str) -> bool:
-                                with s._recent_trades_lock:
-                                    if aid not in s._recent_trades or s._recent_trades[aid]["sell"] is None:
-                                        return False
-                                    now2 = time.time()
-                                    return (now2 - s._recent_trades[aid]["sell"]) < COOLDOWN_PERIOD
                             opposite = state.get_asset_pair(asset_id)
-                            if not opposite:
-                                return
                             if delta > 0 and not is_recently_bought(state, asset_id):
-                                if place_buy_order(state, asset_id, "Spike detected"):
-                                    place_sell_order(state, opposite, "Opposite trade")
-                            elif delta < 0 and not is_recently_sold(state, asset_id):
-                                if place_sell_order(state, asset_id, "Spike detected"):
-                                    place_buy_order(state, opposite, "Opposite trade")
+                                place_buy_order(state, asset_id, "Spike up")
+                            elif delta < 0 and opposite is not None and  not is_recently_bought(state, opposite):
+                                place_buy_order(state, opposite, "Spike down → buy opposite")
                     except Exception as e:
                         logger.error(f"❌ Error processing asset {asset_id}: {str(e)}")
                         return
@@ -226,21 +216,11 @@ def detect_and_trade_window(state: ThreadSafeState) -> None:
                                         return False
                                     now2 = time.time()
                                     return (now2 - s._recent_trades[tid]["buy"]) < COOLDOWN_PERIOD
-                            def is_recently_sold(s: ThreadSafeState, tid: str) -> bool:
-                                with s._recent_trades_lock:
-                                    if tid not in s._recent_trades or s._recent_trades[tid]["sell"] is None:
-                                        return False
-                                    now2 = time.time()
-                                    return (now2 - s._recent_trades[tid]["sell"]) < COOLDOWN_PERIOD
                             opposite = state.get_asset_pair(aid)
-                            if not opposite:
-                                return
                             if window_delta > 0 and not is_recently_bought(state, aid):
-                                if place_buy_order(state, aid, f"Spike detected | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}"):
-                                    place_sell_order(state, opposite, "Opposite trade")
-                            elif window_delta < 0 and not is_recently_sold(state, aid):
-                                if place_sell_order(state, aid, f"Spike detected | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}"):
-                                    place_buy_order(state, opposite, "Opposite trade")
+                                place_buy_order(state, aid, f"Spike up | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}")
+                            elif window_delta < 0 and opposite and not is_recently_bought(state, opposite):
+                                place_buy_order(state, opposite, f"Spike down → buy opposite | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}")
                     except Exception as e:
                         logger.error(f"❌ Error processing asset {aid}: {str(e)}")
                         return

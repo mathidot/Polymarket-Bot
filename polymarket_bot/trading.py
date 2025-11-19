@@ -75,6 +75,10 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 return False
             min_ask_price = float(ask_data["min_ask_price"])
             min_ask_size = float(ask_data["min_ask_size"])
+            liquidity_usd = min_ask_size * min_ask_price
+            if liquidity_usd < MIN_LIQUIDITY_REQUIREMENT:
+                logger.info(f"⏭️ Skip BUY {asset}: ask liquidity ${liquidity_usd:.4f} < min ${MIN_LIQUIDITY_REQUIREMENT:.4f}")
+                return False
             max_shares_by_unit = TRADE_UNIT / min_ask_price if min_ask_price > 0 else 0.0
             max_shares_by_balance = state.get_sim_balance() / min_ask_price if min_ask_price > 0 else 0.0
             shares_to_buy = min(min_ask_size, max_shares_by_unit, max_shares_by_balance)
@@ -103,6 +107,10 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
             return False
         min_ask_price = float(ask_data["min_ask_price"])
         min_ask_size = float(ask_data["min_ask_size"])
+        liquidity_usd = min_ask_size * min_ask_price
+        if liquidity_usd < MIN_LIQUIDITY_REQUIREMENT:
+            logger.info(f"⏭️ Skip BUY {asset}: ask liquidity ${liquidity_usd:.4f} < min ${MIN_LIQUIDITY_REQUIREMENT:.4f}")
+            return False
         # 按 trade_unit 限制美元金额；以卖家可卖量限制份额
         max_shares_by_unit = TRADE_UNIT / min_ask_price if min_ask_price > 0 else 0.0
         shares_to_buy = min(min_ask_size, max_shares_by_unit)
@@ -170,11 +178,6 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                 if asset in active:
                     balance = float(getattr(active[asset], "shares", 0.0))
                 sell_amount_in_shares = balance
-                if sell_amount_in_shares < 1:
-                    continue
-                # cap sell amount by TRADE_UNIT (USD) using vwap
-                max_sell_shares = min(sell_amount_in_shares, TRADE_UNIT / vwap if vwap > 0 else sell_amount_in_shares)
-                sell_amount_in_shares = max_sell_shares
                 if (current_price - vwap) > SLIPPAGE_TOLERANCE:
                     return False
                 logger.info(f"📝 Sell Reason: {reason} | Asset: {asset} | Current: ${current_price:.4f} | VWAP: ${vwap:.4f} | Amount: {sell_amount_in_shares:.4f}")
