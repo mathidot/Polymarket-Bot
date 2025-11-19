@@ -106,6 +106,11 @@ SPIKE_SPREAD_BUFFER=0.005            # 阈值中的价差缓冲项
 DEPTH_USD_TARGET=3.0                 # 深度评估目标美元量，默认=trade_unit
 MAX_DEPTH_LEVELS=5                   # 订单簿聚合档位数
 MIN_TRIGGER_INTERVAL_SECONDS=15      # 同资产最小触发间隔（防回转）
+
+# 概率阈值策略（可选）
+PROB_THRESHOLD_STRATEGY_ENABLE=false # 启用“概率阈值入场/止损”策略
+PROB_ENTRY_THRESHOLD=0.80            # 入场价格阈值（例如 0.80=80%）
+PROB_STOP_THRESHOLD=0.60             # 止损价格阈值（例如 0.60=60%）
 ```
 
 4. 并发与频率（可选）
@@ -154,7 +159,7 @@ SIM_START_USDC=100.0                   # 初始模拟 USDC 余额
 - `keep_min_shares`: Minimum shares to keep when selling
 - `max_concurrent_trades`: Maximum number of concurrent trades
 - `min_liquidity_requirement`: Minimum liquidity required to trade (USDC)
-- 交易金额上限：每次买入或卖出的美元金额均不超过 `trade_unit`（买入以可成交深度USD与 `trade_unit` 取最小值，卖出按 VWAP 将份额上限限制为 `trade_unit / vwap`）
+- 交易金额/份额：买入美元金额不超过 `trade_unit`（以可成交深度USD与 `trade_unit` 取最小值）；卖出为一次性全清仓
 
 ### 检测与执行改动（新增）
 - 两点检测（默认）：主检测函数仅比较“上一个价格 vs 当前价格”的相对变化 `delta = (p1-p0)/p0`。
@@ -163,6 +168,7 @@ SIM_START_USDC=100.0                   # 初始模拟 USDC 余额
 - 并发检测：按资产并行处理，受 `DETECT_CONCURRENCY` 控制；退出检查按交易并行，受 `EXIT_CONCURRENCY` 控制。
 - 采价并发与周期：按 `FETCH_CONCURRENCY` 并行抓取价格；以 `FETCH_INTERVAL_MS` 控制最小轮询周期；拿不到价格不重试，当前轮直接跳过。
 - 买入逻辑简化：买入使用最优卖价与卖家可卖量，美元金额不超过 `trade_unit`；卖出侧按 VWAP 将份额上限限制为 `trade_unit / vwap`。
+- 买入逻辑与卖出行为：买入使用最优卖价与卖家可卖量，美元金额不超过 `trade_unit`；卖出为一次性全清仓。
 - 日志增强：检测打印 `delta/threshold/spread/sigma/窗口大小`；执行打印买卖理由与成交详情。
 - `price_lower_bound`: 尖刺检测后允许交易的价格下界（默认 0.20）
 - `price_upper_bound`: 尖刺检测后允许交易的价格上界（默认 0.80）
@@ -171,8 +177,15 @@ SIM_START_USDC=100.0                   # 初始模拟 USDC 余额
 - `SIM_MODE`: 启用后买卖均在本地模拟，不调用真实下单接口
 - `SIM_START_USDC`: 初始模拟余额；买入扣减余额，卖出增加余额
 - 买入：使用最优卖价与卖家可卖量，美元金额不超过 `trade_unit`，且不超过当前模拟余额
-- 卖出：以当前价格作为成交价，份额上限为 `trade_unit/vwap`（模拟使用当前价代替 vwap）
+- 卖出：以当前价格作为成交价，一次性全清仓
 - 余额/额度不足：仅打印告警并跳过该笔交易，不报错、不重试
+
+### 概率阈值策略
+- 入场：当某个选项最新价格达到 `PROB_ENTRY_THRESHOLD`（如 0.80）时买入；每个选项只买一次
+- 止损：当该选项最新价格低于等于 `PROB_STOP_THRESHOLD`（如 0.60）时卖出止损
+- 金额：买入金额由 `trade_unit` 控制（例如 `trade_unit=5` 即买入 5 USDC）
+- 线程：启用后运行独立线程 `prob_strategy`（检测）与 `prob_exits`（退出），替代默认尖刺检测与退出线程
+- 价格过滤：遵守 `price_lower_bound/price_upper_bound` 与 `PRICE_FRESHNESS_SECONDS` 新鲜度校验
 
 ## 运行方式
 
@@ -182,6 +195,16 @@ SIM_START_USDC=100.0                   # 初始模拟 USDC 余额
 python app.py
 ```
 启动后会输出 Watchlist 汇总日志：`slugs/tokens/pairs` 统计与前 20 条 `token → outcome/slug` 映射，便于确认加载情况。
+
+启用概率阈值策略：在 `.env` 设定
+```env
+PROB_THRESHOLD_STRATEGY_ENABLE=true
+PROB_ENTRY_THRESHOLD=0.80
+PROB_STOP_THRESHOLD=0.60
+trade_unit=5
+min_liquidity_requirement=50
+```
+随后运行入口启动即可生效。
 
 监控清单文件（仅 Watchlist 模式）：在项目根目录创建 `watchlist_slugs.json`：
 ```json

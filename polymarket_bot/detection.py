@@ -13,6 +13,7 @@ from .config import PRICE_FRESHNESS_SECONDS
 from .config import COOLDOWN_PERIOD
 from .config import FETCH_INTERVAL_MS, FETCH_CONCURRENCY, DETECT_CONCURRENCY, EXIT_CONCURRENCY
 from .config import SIM_MODE
+from .config import PROB_ENTRY_THRESHOLD_HIGH
 from .trading import place_buy_order, place_sell_order
 from .pricing import get_current_price
 from .client import get_client
@@ -409,7 +410,7 @@ def run_prob_threshold_strategy(state: ThreadSafeState) -> None:
                         price_now = float(history[-1][1])
                         if state.was_bought_once(asset_id):
                             return
-                        if price_now >= PROB_ENTRY_THRESHOLD:
+                        if price_now >= PROB_ENTRY_THRESHOLD and price_now <= PROB_ENTRY_THRESHOLD_HIGH:
                             ok = place_buy_order(state, asset_id, f"Prob-threshold entry @ {price_now:.4f}")
                             if ok:
                                 state.mark_bought_once(asset_id)
