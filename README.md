@@ -122,6 +122,12 @@ EXIT_CONCURRENCY=4                     # 退出并发线程数（按交易）
 PRICE_FRESHNESS_SECONDS=2.5            # 超过该秒数未更新则跳过该资产
 ```
 
+5. 模拟模式（可选）
+```env
+SIM_MODE=true                          # 启用模拟账户，不发真实订单
+SIM_START_USDC=100.0                   # 初始模拟 USDC 余额
+```
+
 ## 配置参数
 
 ### Wallet Settings
@@ -160,6 +166,13 @@ PRICE_FRESHNESS_SECONDS=2.5            # 超过该秒数未更新则跳过该资
 - 日志增强：检测打印 `delta/threshold/spread/sigma/窗口大小`；执行打印买卖理由与成交详情。
 - `price_lower_bound`: 尖刺检测后允许交易的价格下界（默认 0.20）
 - `price_upper_bound`: 尖刺检测后允许交易的价格上界（默认 0.80）
+
+### 模拟模式
+- `SIM_MODE`: 启用后买卖均在本地模拟，不调用真实下单接口
+- `SIM_START_USDC`: 初始模拟余额；买入扣减余额，卖出增加余额
+- 买入：使用最优卖价与卖家可卖量，美元金额不超过 `trade_unit`，且不超过当前模拟余额
+- 卖出：以当前价格作为成交价，份额上限为 `trade_unit/vwap`（模拟使用当前价代替 vwap）
+- 余额/额度不足：仅打印告警并跳过该笔交易，不报错、不重试
 
 ## 运行方式
 
@@ -206,6 +219,7 @@ The bot maintains detailed logs in the `logs` directory:
 - 检测与退出评估按事件驱动与每秒轮询混合执行，受并发参数控制
 - Watchlist 使用 Gamma API 解析 `slug → markets → tokens`，避免 `www.polymarket.com/api/events/...` 的 404 问题
 - 请求会话使用 `requests.Session + Retry` 并可通过 `REQUESTS_VERIFY_SSL` 控制证书验证
+ - 模拟模式启用时不会发出真实订单，日志将包含 `SIM BUY` / `SIM SELL` 标记
 
 ## Disclaimer
 

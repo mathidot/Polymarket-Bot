@@ -42,6 +42,9 @@ class ThreadSafeState:
         self._counter: int = 0
         self._watchlist_tokens: List[str] = []
         self._token_meta: Dict[str, Tuple[str, str]] = {}
+        self._sim_lock = Lock()
+        self._sim_enabled: bool = False
+        self._sim_usdc_balance: float = 0.0
     def cleanup(self) -> None:
         """清理内部状态并标记清理完成。"""
         if not self._cleanup_complete.is_set():
@@ -139,6 +142,30 @@ class ThreadSafeState:
         """设置监控 token 列表及其元数据（slug/outcome）。"""
         self._watchlist_tokens = tokens
         self._token_meta = meta
+
+    def enable_simulation(self, start_balance_usd: float) -> None:
+        with self._sim_lock:
+            self._sim_enabled = True
+            try:
+                self._sim_usdc_balance = float(start_balance_usd)
+            except Exception:
+                self._sim_usdc_balance = 0.0
+
+    def is_simulation_enabled(self) -> bool:
+        with self._sim_lock:
+            return self._sim_enabled
+
+    def get_sim_balance(self) -> float:
+        with self._sim_lock:
+            return float(self._sim_usdc_balance)
+
+    def adjust_sim_balance(self, delta_usd: float) -> float:
+        with self._sim_lock:
+            try:
+                self._sim_usdc_balance = float(self._sim_usdc_balance) + float(delta_usd)
+            except Exception:
+                pass
+            return float(self._sim_usdc_balance)
 
     def get_watchlist_tokens(self) -> List[str]:
         """获取监控的 token ID 列表。"""

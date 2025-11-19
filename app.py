@@ -9,7 +9,7 @@ from polymarket_bot.state import ThreadSafeState
 from polymarket_bot.threads import ThreadManager
 from polymarket_bot.detection import wait_for_initialization, update_price_history, detect_and_trade, check_trade_exits
 from polymarket_bot.client import refresh_api_credentials
-from polymarket_bot.config import REFRESH_INTERVAL
+from polymarket_bot.config import REFRESH_INTERVAL, SIM_MODE, SIM_START_USDC
 
 def print_spikebot_banner() -> None:
     """打印启动横幅。"""
@@ -45,6 +45,8 @@ def signal_handler(signum: int, frame: any, state: ThreadSafeState) -> None:
 def main() -> None:
     """主函数：初始化状态与线程，启动采集/检测/退出模块与凭证刷新。"""
     state = ThreadSafeState()
+    if SIM_MODE:
+        state.enable_simulation(SIM_START_USDC)
     thread_manager = ThreadManager(state)
     print_spikebot_banner()
     signal.signal(signal.SIGINT, lambda s, f: signal_handler(s, f, state))
@@ -74,7 +76,13 @@ def main() -> None:
             current_time = time.time()
             if current_time - last_status_time >= 30:
                 active_threads = sum(1 for t in thread_manager.threads.values() if t.is_alive())
-                logger.info(f"📊 Bot Status | Active Threads: {active_threads}/3 | Price Updates: {len(state._price_history)}")
+                if SIM_MODE and state.is_simulation_enabled():
+                    try:
+                        logger.info(f"📊 Bot Status | Active Threads: {active_threads}/3 | Price Updates: {len(state._price_history)} | SIM Balance: ${state.get_sim_balance():.2f}")
+                    except Exception:
+                        logger.info(f"📊 Bot Status | Active Threads: {active_threads}/3 | Price Updates: {len(state._price_history)}")
+                else:
+                    logger.info(f"📊 Bot Status | Active Threads: {active_threads}/3 | Price Updates: {len(state._price_history)}")
                 last_status_time = current_time
             if current_time - last_refresh_time > refresh_interval:
                 if refresh_api_credentials():

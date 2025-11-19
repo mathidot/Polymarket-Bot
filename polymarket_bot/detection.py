@@ -11,6 +11,7 @@ from .config import DELTA_MODE, DETECT_LOOKBACK_SECONDS, DETECT_LOOKBACK_SAMPLES
 from .config import PRICE_FRESHNESS_SECONDS
 from .config import COOLDOWN_PERIOD
 from .config import FETCH_INTERVAL_MS, FETCH_CONCURRENCY, DETECT_CONCURRENCY, EXIT_CONCURRENCY
+from .config import SIM_MODE
 from .trading import place_buy_order, place_sell_order
 from .pricing import get_current_price
 from .client import get_client
@@ -76,8 +77,14 @@ def update_price_history(state: ThreadSafeState) -> None:
             if current_time - last_log_time >= 5:
                 if price_updates:
                     logger.info("📊 Price Updates:\n" + "\n".join(price_updates))
+                    logger.info("📊 Account balance Updates:\n" + "\n".join(price_updates))
                 else:
                     logger.info(f"📊 Price Updates: none | tokens={len(tokens)}")
+                if SIM_MODE and state.is_simulation_enabled():
+                    try:
+                        logger.info(f"💼 SIM Balance: ${state.get_sim_balance():.4f}")
+                    except Exception:
+                        pass
                 last_log_time = current_time
             if price_updated:
                 price_update_event.set()
@@ -123,9 +130,11 @@ def detect_and_trade(state: ThreadSafeState) -> None:
                     try:
                         history = state.get_price_history(asset_id)
                         if not history or len(history) < 2:
+                            logger.warning(f"⚠️ length of history: {len(history)}, length is not enough, skip")
                             return
                         last_ts = float(history[-1][0])
                         if time.time() - last_ts > PRICE_FRESHNESS_SECONDS:
+                            logger.warning("⚠️ holding time is too long, skip")
                             return
                         old_price = float(history[-2][1])
                         new_price = float(history[-1][1])

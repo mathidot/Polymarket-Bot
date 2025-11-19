@@ -20,13 +20,17 @@ def get_min_ask_data(asset: str) -> Optional[Dict[str, Any]]:
             return None
         order = cli.get_order_book(asset)
         if order.asks:
-            # 为避免不同 API 返回的排序差异，显式选择最低卖价
-            best_ask = min(order.asks, key=lambda lvl: float(lvl.price))
             buy_price = cli.get_price(asset, "BUY")
-            min_ask_price = best_ask.price
-            min_ask_size = best_ask.size
-            return {"buy_price": buy_price, "min_ask_price": min_ask_price, "min_ask_size": min_ask_size}
+            min_ask_price = order.asks[-1].price
+            min_ask_size = order.asks[-1].size
+            logger.info(f"min_ask_price: {min_ask_price}, min_ask_size: {min_ask_size}")
+            return {
+                "buy_price": buy_price,
+                "min_ask_price": min_ask_price,
+                "min_ask_size": min_ask_size
+            }
         else:
+            logger.error(f"❌ No ask data found for {asset}")
             return None
     except Exception as e:
         logger.error(f"❌ Failed to get ask data for {asset}: {str(e)}")
@@ -49,12 +53,17 @@ def get_max_bid_data(asset: str) -> Optional[Dict[str, Any]]:
         order = cli.get_order_book(asset)
         if order.bids:
             # 显式选择最高买价
-            best_bid = max(order.bids, key=lambda lvl: float(lvl.price))
             sell_price = cli.get_price(asset, "SELL")
-            max_bid_price = best_bid.price
-            max_bid_size = best_bid.size
-            return {"sell_price": sell_price, "max_bid_price": max_bid_price, "max_bid_size": max_bid_size}
+            max_bid_price = order.bids[-1].price
+            max_bid_size = order.bids[-1].size
+            logger.info(f"max_bid_price: {max_bid_price}, max_bid_size: {max_bid_size}")
+            return {
+                "sell_price": sell_price,
+                "max_bid_price": max_bid_price,
+                "max_bid_size": max_bid_size
+            }
         else:
+            logger.error(f"❌ No bid data found for {asset}")
             return None
     except Exception as e:
         logger.error(f"❌ Failed to get bid data for {asset}: {str(e)}")
