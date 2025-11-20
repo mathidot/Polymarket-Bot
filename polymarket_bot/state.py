@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Optional
 from .types import TradeInfo, PositionInfo
 from .types import TradeType
 from .exceptions import ValidationError
-from .config import PRICE_HISTORY_SIZE, KEEP_MIN_SHARES
+from .config import PRICE_HISTORY_SIZE, KEEP_MIN_SHARES, MAX_CONCURRENT_TRADES
 from .logger import logger
 
 price_update_event = Event()
@@ -47,6 +47,11 @@ class ThreadSafeState:
         self._sim_usdc_balance: float = 0.0
         self._bought_once_lock = Lock()
         self._bought_once: set = set()
+        # 并发交易插槽预留计数（防止并发下超过上限）
+        self._active_trade_reservations: int = 0
+        # 每资产的下单互斥锁，避免同一资产被多线程同时买/卖
+        self._asset_order_locks: Dict[str, Lock] = {}
+        self._asset_order_locks_lock = Lock()
     def cleanup(self) -> None:
         """清理内部状态并标记清理完成。"""
         if not self._cleanup_complete.is_set():
@@ -164,10 +169,50 @@ class ThreadSafeState:
     def adjust_sim_balance(self, delta_usd: float) -> float:
         with self._sim_lock:
             try:
+                logger.info(f"Adjusting sim balance by {delta_usd} USDC, current balance: {self._sim_usdc_balance}")
                 self._sim_usdc_balance = float(self._sim_usdc_balance) + float(delta_usd)
             except Exception:
                 pass
             return float(self._sim_usdc_balance)
+
+    def try_reserve_trade_slot(self) -> bool:
+        """尝试预留一个并发交易插槽。"""
+        with self._active_trades_lock:
+            current = len(self._active_trades)
+            if current + self._active_trade_reservations >= MAX_CONCURRENT_TRADES:
+                return False
+            self._active_trade_reservations += 1
+            return True
+
+    def release_trade_slot(self) -> None:
+        """释放一个预留的并发交易插槽。"""
+        with self._active_trades_lock:
+            if self._active_trade_reservations > 0:
+                self._active_trade_reservations -= 1
+
+    def try_acquire_asset_order(self, asset_id: str) -> bool:
+        """尝试获取指定资产的下单互斥锁（非阻塞）。成功返回 True。"""
+        # 先确保锁对象存在
+        with self._asset_order_locks_lock:
+            if asset_id not in self._asset_order_locks:
+                self._asset_order_locks[asset_id] = Lock()
+            lock = self._asset_order_locks[asset_id]
+        try:
+            return lock.acquire(blocking=False)
+        except Exception:
+            return False
+
+    def release_asset_order(self, asset_id: str) -> None:
+        """释放指定资产的下单互斥锁，容错处理未持有锁的情况。"""
+        with self._asset_order_locks_lock:
+            lock = self._asset_order_locks.get(asset_id)
+        if not lock:
+            return
+        try:
+            lock.release()
+        except Exception:
+            # 未持有锁或重复释放，忽略
+            pass
 
     def get_watchlist_tokens(self) -> List[str]:
         """获取监控的 token ID 列表。"""
