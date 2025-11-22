@@ -13,6 +13,7 @@ from .config import PRICE_FRESHNESS_SECONDS
 from .config import COOLDOWN_PERIOD
 from .config import FETCH_INTERVAL_MS, FETCH_CONCURRENCY, DETECT_CONCURRENCY, EXIT_CONCURRENCY
 from .config import SIM_MODE
+from .config import SETTLEMENT_SWEEP_ENABLE, SETTLED_PRICE_LOW, SETTLED_PRICE_HIGH, SETTLEMENT_SWEEP_INTERVAL_SEC
 from .config import PROB_ENTRY_THRESHOLD_HIGH
 from .trading import place_buy_order, place_sell_order
 from .pricing import get_current_price
@@ -457,4 +458,50 @@ def run_prob_threshold_exits(state: ThreadSafeState) -> None:
             time.sleep(1)
         except Exception as e:
             logger.error(f"❌ Error in run_prob_threshold_exits: {str(e)}")
+            time.sleep(1)
+
+def run_settlement_sweeper(state: ThreadSafeState) -> None:
+    """在市场最终结算时，自动清算所有持仓并计入模拟金额。
+
+    当 `current_price` 接近 0 或 1（由阈值控制）时，认为该资产已结算，
+    触发一次性卖出以将剩余份额按最终价格价值计入模拟余额。
+
+    Args:
+        state: 线程安全状态对象。
+    """
+    last_log_time = time.time()
+    while not state.is_shutdown():
+        try:
+            if not SETTLEMENT_SWEEP_ENABLE:
+                time.sleep(1)
+                continue
+            active_trades = state.get_active_trades()
+            if active_trades:
+                current_time = time.time()
+                if current_time - last_log_time >= 30:
+                    logger.info(f"🔚 Settlement Sweeper | Active Trades: {len(active_trades)} | Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    last_log_time = current_time
+            items = list(active_trades.items())
+            def _process_settlement(item):
+                asset_id, trade = item
+                try:
+                    price_now = get_current_price(state, asset_id)
+                    if price_now is None:
+                        return
+                    # 认为已结算：价格接近 0 或 1
+                    if price_now >= SETTLED_PRICE_HIGH or price_now <= SETTLED_PRICE_LOW:
+                        place_sell_order(state, asset_id, f"Settlement sweep @ {price_now:.4f}")
+                        state.remove_active_trade(asset_id)
+                        state.set_last_trade_time(time.time())
+                        return
+                except Exception as e:
+                    logger.error(f"❌ Error in settlement sweep for {asset_id}: {str(e)}")
+                    return
+            if items:
+                with ThreadPoolExecutor(max_workers=EXIT_CONCURRENCY) as ex:
+                    list(ex.map(_process_settlement, items))
+            # 周期扫描间隔可配置
+            time.sleep(max(0.5, float(SETTLEMENT_SWEEP_INTERVAL_SEC)))
+        except Exception as e:
+            logger.error(f"❌ Error in run_settlement_sweeper: {str(e)}")
             time.sleep(1)

@@ -7,9 +7,9 @@ from halo import Halo
 from polymarket_bot.logger import logger
 from polymarket_bot.state import ThreadSafeState
 from polymarket_bot.threads import ThreadManager
-from polymarket_bot.detection import wait_for_initialization, update_price_history, detect_and_trade, check_trade_exits, run_prob_threshold_strategy, run_prob_threshold_exits
+from polymarket_bot.detection import wait_for_initialization, update_price_history, detect_and_trade, check_trade_exits, run_prob_threshold_strategy, run_prob_threshold_exits, run_settlement_sweeper
 from polymarket_bot.client import refresh_api_credentials
-from polymarket_bot.config import REFRESH_INTERVAL, SIM_MODE, SIM_START_USDC, PROB_THRESHOLD_STRATEGY_ENABLE
+from polymarket_bot.config import REFRESH_INTERVAL, SIM_MODE, SIM_START_USDC, PROB_THRESHOLD_STRATEGY_ENABLE, SETTLEMENT_SWEEP_ENABLE
 
 def print_spikebot_banner() -> None:
     """打印启动横幅。"""
@@ -72,6 +72,9 @@ def main() -> None:
     else:
         thread_manager.start_thread("detect_trade", detect_and_trade)
         thread_manager.start_thread("check_exits", check_trade_exits)
+    # 在模拟模式下启用最终结算的清算线程，将持仓价值加入模拟金额
+    if SIM_MODE and SETTLEMENT_SWEEP_ENABLE:
+        thread_manager.start_thread("settlement_sweeper", run_settlement_sweeper)
     last_refresh_time = time.time()
     refresh_interval = REFRESH_INTERVAL
     last_status_time = time.time()
