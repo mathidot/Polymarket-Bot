@@ -219,9 +219,12 @@ def detect_and_trade_window(state: ThreadSafeState) -> None:
                                     now2 = time.time()
                                     return (now2 - s._recent_trades[tid]["buy"]) < COOLDOWN_PERIOD
                             opposite = state.get_asset_pair(aid)
-                            if window_delta > 0 and not is_recently_bought(state, aid):
+                            # 单边市场限制：若本边或对侧已买过，则跳过当前信号
+                            already_bought_this = state.was_bought_once(aid)
+                            already_bought_opposite = bool(opposite) and state.was_bought_once(opposite)
+                            if window_delta > 0 and not is_recently_bought(state, aid) and not already_bought_this and not already_bought_opposite:
                                 place_buy_order(state, aid, f"Spike up | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}")
-                            elif window_delta < 0 and opposite and not is_recently_bought(state, opposite):
+                            elif window_delta < 0 and opposite and not is_recently_bought(state, opposite) and not already_bought_opposite and not already_bought_this:
                                 place_buy_order(state, opposite, f"Spike down → buy opposite | delta={window_delta:.4f} | thr={threshold:.4f} | spread={spread:.4f} | sigma={sigma:.4f} | win={int(window_len)}")
                     except Exception as e:
                         logger.error(f"❌ Error processing asset {aid}: {str(e)}")

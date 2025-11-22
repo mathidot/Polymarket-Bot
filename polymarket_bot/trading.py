@@ -67,6 +67,20 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
         # 防止同一资产在并发下被重复买入
         if not state.try_acquire_asset_order(asset):
             return False
+        # 单边市场限制：如果另一边已买过（或本边已买过），则不再买入
+        try:
+            if state.was_bought_once(asset):
+                logger.info(f"⛔ Skip BUY {asset}: already bought once")
+                state.release_asset_order(asset)
+                return False
+            opposite = state.get_asset_pair(asset)
+            if opposite and state.was_bought_once(opposite):
+                logger.info(f"⛔ Skip BUY {asset}: opposite side already bought once ({opposite})")
+                state.release_asset_order(asset)
+                return False
+        except Exception:
+            # 保护性：状态查询异常时不中断流程
+            pass
         # 并发交易插槽原子预留，避免多个线程同时通过上限检查
         reserved = state.try_reserve_trade_slot()
         if not reserved:
@@ -108,6 +122,11 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
             trade_info = TradeInfo(entry_price=min_ask_price, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True, shares=float(shares_to_buy))
             state.update_recent_trade(asset, TradeType.BUY)
             state.add_active_trade(asset, trade_info)
+            # 记录已买入（单边市场策略），避免后续买入对侧
+            try:
+                state.mark_bought_once(asset)
+            except Exception:
+                pass
             state.set_last_trade_time(time.time())
             state.release_trade_slot()
             state.release_asset_order(asset)
@@ -156,6 +175,11 @@ def place_buy_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
             trade_info = TradeInfo(entry_price=min_ask_price, entry_time=time.time(), amount=amount_in_dollars, bot_triggered=True, shares=float(filled))
             state.update_recent_trade(asset, TradeType.BUY)
             state.add_active_trade(asset, trade_info)
+            # 记录已买入（单边市场策略），避免后续买入对侧
+            try:
+                state.mark_bought_once(asset)
+            except Exception:
+                pass
             state.set_last_trade_time(time.time())
             state.release_trade_slot()
             state.release_asset_order(asset)
@@ -233,16 +257,37 @@ def place_sell_order(state: ThreadSafeState, asset: str, reason: str) -> bool:
                                     price=float(bid_data.get("max_bid_price", 0.0)),
                                     size=float(bid_data.get("max_bid_size", 0.0))
                                 )]
+                        # 兼容对象或 dict 结构的 bids，先构建可排序的价格键
                         try:
-                            bids = sorted(bids, key=lambda l: float(getattr(l, "price", 0.0)), reverse=True)
+                            sortable = []
+                            for lvl in bids:
+                                px_key = 0.0
+                                try:
+                                    val = getattr(lvl, "price", None)
+                                    if val is not None:
+                                        px_key = float(val)
+                                    else:
+                                        # 可能是 dict
+                                        if isinstance(lvl, dict):
+                                            px_key = float(lvl.get("price", 0.0))
+                                except Exception:
+                                    # 保持默认 0.0
+                                    pass
+                                sortable.append((px_key, lvl))
+                            bids = [item[1] for item in sorted(sortable, key=lambda t: t[0], reverse=True)]
                         except Exception:
                             pass
                         for lvl in bids:
                             if remaining <= 0:
                                 break
+                            # 提取价格/数量，兼容对象或 dict
                             try:
-                                px = float(getattr(lvl, "price", 0.0))
-                                sz = float(getattr(lvl, "size", 0.0))
+                                if isinstance(lvl, dict):
+                                    px = float(lvl.get("price", 0.0))
+                                    sz = float(lvl.get("size", 0.0))
+                                else:
+                                    px = float(getattr(lvl, "price", 0.0))
+                                    sz = float(getattr(lvl, "size", 0.0))
                             except (TypeError, ValueError):
                                 continue
                             if px <= 0 or sz <= 0:
